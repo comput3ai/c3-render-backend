@@ -1,4 +1,5 @@
 redis
 requests
 python-dotenv
-minio 
+minio
+gradio_client 

@@ -3,11 +3,13 @@ import os
 import uuid
 import json
 import logging
+import re
 from datetime import datetime
 from flask import Flask, request, jsonify
 from redis import Redis
 from dotenv import load_dotenv
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
+from urllib.parse import urlparse
 
 # Load environment variables
 load_dotenv()
@@ -48,6 +50,8 @@ def create_job(job_type: str, data: Dict[str, Any]) -> str:
     # Add to the single processing queue
     redis_client.rpush(JOB_QUEUE, job_id)
     
+    logger.info(f"Created {job_type} job {job_id}")
+    
     return job_id
 
 def get_job_status(job_id: str) -> Optional[Dict[str, Any]]:
@@ -57,90 +61,302 @@ def get_job_status(job_id: str) -> Optional[Dict[str, Any]]:
         return None
     return job_data
 
+def validate_url(url: str) -> bool:
+    """Validate if a string is a valid URL"""
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except:
+        return False
+        
+def validate_float(value: Any, min_val: float = None, max_val: float = None) -> bool:
+    """Validate if a value is a valid float within the specified range"""
+    try:
+        float_val = float(value)
+        if min_val is not None and float_val < min_val:
+            return False
+        if max_val is not None and float_val > max_val:
+            return False
+        return True
+    except:
+        return False
+        
+def validate_int(value: Any, min_val: int = None, max_val: int = None) -> bool:
+    """Validate if a value is a valid integer within the specified range"""
+    try:
+        int_val = int(value)
+        if min_val is not None and int_val < min_val:
+            return False
+        if max_val is not None and int_val > max_val:
+            return False
+        return True
+    except:
+        return False
+
+def validate_csm_params(data: Dict[str, Any]) -> Tuple[bool, str]:
+    """Validate parameters for CSM text-to-speech"""
+    # For backward compatibility, if text is provided but monologue is not, use text as monologue
+    if "text" in data and "monologue" not in data:
+        data["monologue"] = data["text"]
+    
+    # Check for required field
+    if not data or "monologue" not in data:
+        return False, "Missing required field: monologue"
+    
+    # Validate monologue is not empty
+    if not data["monologue"].strip():
+        return False, "Monologue cannot be empty"
+    
+    # Validate voice option
+    if "voice" in data:
+        # For API consistency, map "random_voice" to "random" if provided
+        if data["voice"] == "random_voice":
+            data["voice"] = "random"
+            
+        valid_voices = ["random", "conversational_a", "conversational_b", "clone"]
+        if data["voice"] not in valid_voices:
+            return False, f"Invalid voice option. Must be one of: {', '.join(valid_voices)}"
+        
+        # For voice cloning, validate required parameters
+        if data["voice"] == "clone":
+            if "reference_audio_url" not in data:
+                return False, "reference_audio_url is required for voice cloning"
+            if not validate_url(data["reference_audio_url"]):
+                return False, "reference_audio_url must be a valid URL"
+                
+            if "reference_text" not in data:
+                return False, "reference_text is required for voice cloning"
+            if not data["reference_text"].strip():
+                return False, "reference_text cannot be empty"
+    else:
+        # Default to "random" if voice is not specified
+        data["voice"] = "random"
+    
+    # Validate optional parameters if present
+    if "temperature" in data and not validate_float(data["temperature"], 0, 2):
+        return False, "temperature must be a float between 0 and 2"
+        
+    if "topk" in data and not validate_int(data["topk"], 1, 100):
+        return False, "topk must be an integer between 1 and 100"
+        
+    if "max_audio_length" in data and not validate_int(data["max_audio_length"], 1000, 30000):
+        return False, "max_audio_length must be an integer between 1000 and 30000"
+        
+    if "pause_duration" in data and not validate_int(data["pause_duration"], 0, 500):
+        return False, "pause_duration must be an integer between 0 and 500"
+    
+    # Validate notify_url if present
+    if "notify_url" in data and not validate_url(data["notify_url"]):
+        return False, "notify_url must be a valid URL"
+    
+    return True, ""
+
+def validate_whisper_params(data: Dict[str, Any]) -> Tuple[bool, str]:
+    """Validate parameters for Whisper speech-to-text"""
+    # Check for required field
+    if not data or "audio_url" not in data:
+        return False, "Missing required field: audio_url"
+    
+    # Validate audio_url
+    if not validate_url(data["audio_url"]):
+        return False, "audio_url must be a valid URL"
+    
+    # Validate model if provided
+    if "model" in data:
+        valid_models = ["tiny", "base", "small", "medium", "large"]
+        if data["model"] not in valid_models:
+            return False, f"Invalid model. Must be one of: {', '.join(valid_models)}"
+    
+    # Validate notify_url if present
+    if "notify_url" in data and not validate_url(data["notify_url"]):
+        return False, "notify_url must be a valid URL"
+    
+    return True, ""
+
+def validate_portrait_params(data: Dict[str, Any]) -> Tuple[bool, str]:
+    """Validate parameters for portrait video generation"""
+    # Check for required field
+    if not data or "image_url" not in data:
+        return False, "Missing required field: image_url"
+    
+    # Validate image_url
+    if not validate_url(data["image_url"]):
+        return False, "image_url must be a valid URL"
+    
+    # Validate audio_url if provided
+    if "audio_url" in data and not validate_url(data["audio_url"]):
+        return False, "audio_url must be a valid URL"
+    
+    # Validate notify_url if present
+    if "notify_url" in data and not validate_url(data["notify_url"]):
+        return False, "notify_url must be a valid URL"
+    
+    return True, ""
+
+def validate_analyze_params(data: Dict[str, Any]) -> Tuple[bool, str]:
+    """Validate parameters for image analysis"""
+    # Check for required field
+    if not data or "image_url" not in data:
+        return False, "Missing required field: image_url"
+    
+    # Validate image_url
+    if not validate_url(data["image_url"]):
+        return False, "image_url must be a valid URL"
+    
+    # Validate notify_url if present
+    if "notify_url" in data and not validate_url(data["notify_url"]):
+        return False, "notify_url must be a valid URL"
+    
+    return True, ""
+
 @app.route("/csm", methods=["POST"])
 def text_to_speech():
     """Text-to-speech endpoint with voice cloning"""
-    data = request.get_json()
-    
-    # Validate required fields
-    if not data or "text" not in data:
-        return jsonify({"error": "Missing required field: text"}), 400
+    try:
+        data = request.get_json()
         
-    # Validate audio_url and audio_text if provided
-    if "audio_url" in data and "audio_text" not in data:
-        return jsonify({"error": "audio_text is required when audio_url is provided"}), 400
-    
-    job_id = create_job("csm", data)
-    return jsonify({"id": job_id})
+        # Validate input parameters
+        is_valid, error_message = validate_csm_params(data)
+        if not is_valid:
+            return jsonify({"error": error_message}), 400
+        
+        # Create job after validation
+        job_id = create_job("csm", data)
+        return jsonify({"id": job_id, "status": "queued"})
+        
+    except Exception as e:
+        logger.exception(f"Error processing CSM request: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/whisper", methods=["POST"])
 def speech_to_text():
     """Speech-to-text endpoint"""
-    data = request.get_json()
-    
-    # Validate required fields
-    if not data or "audio_url" not in data:
-        return jsonify({"error": "Missing required field: audio_url"}), 400
-    
-    # Set default model if not provided
-    if "model" not in data:
-        data["model"] = "medium"
-    
-    job_id = create_job("whisper", data)
-    return jsonify({"id": job_id})
+    try:
+        data = request.get_json()
+        
+        # Validate input parameters
+        is_valid, error_message = validate_whisper_params(data)
+        if not is_valid:
+            return jsonify({"error": error_message}), 400
+        
+        # Set default model if not provided
+        if "model" not in data:
+            data["model"] = "medium"
+        
+        # Create job after validation
+        job_id = create_job("whisper", data)
+        return jsonify({"id": job_id, "status": "queued"})
+        
+    except Exception as e:
+        logger.exception(f"Error processing Whisper request: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/portrait", methods=["POST"])
 def portrait_video():
     """Portrait video generation endpoint"""
-    data = request.get_json()
-    
-    # Validate required fields
-    if not data or "image_url" not in data:
-        return jsonify({"error": "Missing required field: image_url"}), 400
-    
-    job_id = create_job("portrait", data)
-    return jsonify({"id": job_id})
+    try:
+        data = request.get_json()
+        
+        # Validate input parameters
+        is_valid, error_message = validate_portrait_params(data)
+        if not is_valid:
+            return jsonify({"error": error_message}), 400
+        
+        # Create job after validation
+        job_id = create_job("portrait", data)
+        return jsonify({"id": job_id, "status": "queued"})
+        
+    except Exception as e:
+        logger.exception(f"Error processing Portrait request: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/analyze", methods=["POST"])
 def image_analysis():
     """Image analysis endpoint"""
-    data = request.get_json()
-    
-    # Validate required fields
-    if not data or "image_url" not in data:
-        return jsonify({"error": "Missing required field: image_url"}), 400
-    
-    job_id = create_job("analyze", data)
-    return jsonify({"id": job_id})
+    try:
+        data = request.get_json()
+        
+        # Validate input parameters
+        is_valid, error_message = validate_analyze_params(data)
+        if not is_valid:
+            return jsonify({"error": error_message}), 400
+        
+        # Create job after validation
+        job_id = create_job("analyze", data)
+        return jsonify({"id": job_id, "status": "queued"})
+        
+    except Exception as e:
+        logger.exception(f"Error processing Analyze request: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/status/<job_id>", methods=["GET"])
 def get_status(job_id: str):
     """Get job status endpoint"""
-    job_data = get_job_status(job_id)
-    if not job_data:
-        return jsonify({"error": "Job not found"}), 404
-    
-    return jsonify({"status": job_data["status"]})
+    try:
+        # Validate job ID format
+        if not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', job_id, re.IGNORECASE):
+            return jsonify({"error": "Invalid job ID format"}), 400
+            
+        job_data = get_job_status(job_id)
+        if not job_data:
+            return jsonify({"error": "Job not found"}), 404
+        
+        return jsonify({"id": job_id, "status": job_data["status"]})
+        
+    except Exception as e:
+        logger.exception(f"Error getting job status: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/result/<job_id>", methods=["GET"])
 def get_result(job_id: str):
     """Get job result endpoint"""
-    job_data = get_job_status(job_id)
-    if not job_data:
-        return jsonify({"error": "Job not found"}), 404
-    
-    if job_data["status"] != "success":
-        return jsonify({"error": "Job not completed"}), 400
-    
-    # For text-based results (whisper, analyze)
-    if job_data["type"] in ["whisper", "analyze"]:
-        return jsonify({"text": job_data.get("result")})
-    
-    # For media-based results (csm, portrait)
-    if job_data["type"] in ["csm", "portrait"]:
-        return jsonify({"result_url": job_data.get("result_url")})
-    
-    return jsonify({"error": "Unknown job type"}), 400
+    try:
+        # Validate job ID format
+        if not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', job_id, re.IGNORECASE):
+            return jsonify({"error": "Invalid job ID format"}), 400
+            
+        job_data = get_job_status(job_id)
+        if not job_data:
+            return jsonify({"error": "Job not found"}), 404
+        
+        if job_data["status"] != "success":
+            return jsonify({"error": "Job not completed", "status": job_data["status"]}), 400
+        
+        result = {}
+        
+        # Include job ID and status in all responses
+        result["id"] = job_id
+        result["status"] = job_data["status"]
+        
+        # For text-based results (whisper, analyze)
+        if job_data["type"] in ["whisper", "analyze"]:
+            result["text"] = job_data.get("result")
+        
+        # For media-based results (csm, portrait)
+        if job_data["type"] in ["csm", "portrait"]:
+            result["result_url"] = job_data.get("result_url")
+        
+        # Include error message if it exists
+        if "error" in job_data:
+            result["error"] = job_data["error"]
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.exception(f"Error getting job result: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.errorhandler(404)
+def page_not_found(e):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({"error": "Method not allowed"}), 405
+
+@app.errorhandler(500)
+def internal_server_error(e):
+    return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000"))) 

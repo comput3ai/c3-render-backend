@@ -29,19 +29,14 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - C3_API_KEY=${C3_API_KEY}
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
-      - MINIO_SECURE=false
+      # Minio settings should be configured in c3_render_worker/.env
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
-      minio:
-        condition: service_started
     volumes:
       - ./c3_render_worker:/app/c3_render_worker
+      - ./output:/app/output
     networks:
       - c3render
     env_file:
@@ -63,25 +58,9 @@ services:
     networks:
       - c3render
 
-  minio:
-    image: minio/minio
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    volumes:
-      - minio_data:/data
-    command: server /data --console-address ":9001"
-    restart: unless-stopped
-    networks:
-      - c3render
-
 networks:
   c3render:
     driver: bridge
 
 volumes:
-  redis_data:
-  minio_data: 
+  redis_data: 

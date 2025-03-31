@@ -9,6 +9,8 @@ import threading
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from gradio_client import Client
+import re
 
 # Load environment variables
 load_dotenv()
@@ -20,6 +22,12 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Output directory for temporary files
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/app/output")
+# Ensure output directory exists
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+logger.info(f"Using output directory: {OUTPUT_DIR}")
 
 # Redis configuration
 redis_host = os.getenv("REDIS_HOST", "localhost")
@@ -50,6 +58,10 @@ gpu_instance = None
 last_job_time = datetime.now()
 gpu_monitor_thread = None
 gpu_monitor_active = False
+
+# Current job tracking
+current_job_id = None
+current_job_data = None
 
 def get_running_workloads():
     """Get all currently running workloads"""
@@ -119,52 +131,107 @@ def stop_workload(workload_id):
         return None
 
 def check_node_health(node):
-    """Check if a node is responding"""
+    """Check if a node is responding with retries"""
     node_url = f"https://{node}"
     headers = {"X-C3-API-KEY": api_key}
+    max_retries = 3
 
-    try:
-        response = requests.get(node_url, headers=headers, timeout=5)
-        return response.status_code == 200
-    except (requests.RequestException, Exception) as e:
-        logger.warning(f"🔍 Health check failed for {node}: {str(e)}")
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(node_url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                return True
+            else:
+                logger.warning(f"🔍 Health check attempt {attempt+1}/{max_retries} failed for {node}: status code {response.status_code}")
+        except (requests.RequestException, Exception) as e:
+            logger.warning(f"🔍 Health check attempt {attempt+1}/{max_retries} failed for {node}: {str(e)}")
+        
+        # If not the last attempt, wait before retry
+        if attempt < max_retries - 1:
+            time.sleep(2)
+    
+    return False
+
+def verify_node_in_workloads(node_id):
+    """Verify if the node is still in the workloads API response"""
+    workloads = get_running_workloads()
+    workload_ids = [w.get('workload') for w in workloads]
+    
+    return node_id in workload_ids
+
+def is_gpu_healthy():
+    """Check if the current GPU instance is healthy"""
+    if gpu_instance is None:
         return False
+    
+    node_hostname = gpu_instance.get('node')
+    node_id = gpu_instance.get('workload')
+    
+    # Check 1: Verify the node is still in workloads
+    if not verify_node_in_workloads(node_id):
+        logger.warning(f"⚠️ GPU instance {node_hostname} is no longer in workloads API response")
+        return False
+    
+    # Check 2: Verify the node is responding to health checks
+    if not check_node_health(node_hostname):
+        logger.warning(f"⚠️ GPU instance {node_hostname} failed all health check attempts")
+        return False
+    
+    return True
 
 def start_gpu_monitor():
-    """Start a thread to monitor GPU instance idle time"""
+    """Start a thread to monitor GPU instance health and idle time"""
     global gpu_monitor_thread, gpu_monitor_active
     
     if gpu_monitor_thread is not None and gpu_monitor_thread.is_alive():
         return
     
     gpu_monitor_active = True
-    gpu_monitor_thread = threading.Thread(target=monitor_gpu_idle, daemon=True)
+    gpu_monitor_thread = threading.Thread(target=monitor_gpu, daemon=True)
     gpu_monitor_thread.start()
-    logger.info("Started GPU idle monitor thread")
+    logger.info("Started GPU monitor thread")
 
-def monitor_gpu_idle():
-    """Monitor GPU instance and shut it down if idle for 5 minutes"""
-    global gpu_instance, last_job_time, gpu_monitor_active
+def monitor_gpu():
+    """Monitor GPU instance health and shut it down if idle for too long or unhealthy"""
+    global gpu_instance, last_job_time, gpu_monitor_active, current_job_id, current_job_data
     
     idle_threshold = timedelta(minutes=5)
     
     while gpu_monitor_active and gpu_instance is not None:
-        # Check if the instance has been idle for too long
-        idle_time = datetime.now() - last_job_time
-        
-        if idle_time > idle_threshold:
-            logger.info(f"GPU instance {gpu_instance.get('node')} has been idle for {idle_time}, shutting down")
+        # Check if the instance is healthy
+        if not is_gpu_healthy():
+            logger.warning(f"⚠️ GPU instance {gpu_instance.get('node')} is unhealthy")
+            
+            # If there's an active job, mark it as failed
+            if current_job_id is not None and current_job_data is not None:
+                logger.error(f"⚠️ GPU instance failed during job execution for job {current_job_id}")
+                
+                error_msg = "GPU instance became unhealthy during job execution"
+                update_job_status(current_job_id, "failed", error=error_msg)
+                send_webhook_notification(current_job_id, current_job_data, "failed", error=error_msg)
+            
+            # Shut down the GPU instance
             shutdown_gpu_instance()
             break
         
-        # Log idle status every minute
-        if idle_time.seconds % 60 == 0:
-            logger.info(f"GPU instance idle for {idle_time}")
+        # If no active job, check idle time
+        if current_job_id is None:
+            idle_time = datetime.now() - last_job_time
+            
+            if idle_time > idle_threshold:
+                logger.info(f"GPU instance {gpu_instance.get('node')} has been idle for {idle_time}, shutting down")
+                shutdown_gpu_instance()
+                break
+            
+            # Log idle status every minute
+            if idle_time.seconds % 60 == 0 and idle_time.seconds > 0:
+                logger.info(f"GPU instance idle for {idle_time}")
         
-        # Check every 10 seconds
-        time.sleep(10)
+        # Check every 15 seconds for health, slightly faster checking during jobs
+        # and slightly slower during idle to balance responsiveness and efficiency
+        time.sleep(15)
     
-    logger.info("GPU idle monitor stopped")
+    logger.info("GPU monitor stopped")
 
 def get_gpu_instance():
     """Get or create a GPU instance for processing"""
@@ -173,13 +240,12 @@ def get_gpu_instance():
     # If we already have an instance, update the last job time and return it
     if gpu_instance is not None:
         # Check if the instance is healthy
-        node_hostname = gpu_instance.get('node')
-        if check_node_health(node_hostname):
+        if is_gpu_healthy():
             last_job_time = datetime.now()
-            logger.info(f"Using existing GPU instance: {node_hostname}")
+            logger.info(f"Using existing GPU instance: {gpu_instance.get('node')}")
             return gpu_instance
         else:
-            logger.warning(f"Existing GPU instance {node_hostname} is unhealthy, launching new one")
+            logger.warning(f"Existing GPU instance {gpu_instance.get('node')} is unhealthy, launching new one")
             shutdown_gpu_instance()
     
     # Launch a new GPU instance
@@ -195,24 +261,38 @@ def get_gpu_instance():
         # Start the GPU monitor if not already running
         start_gpu_monitor()
         
-        # Wait a bit for the instance to initialize
+        # Wait for the instance to initialize
         logger.info("Waiting for GPU instance to initialize...")
         time.sleep(5)
         
-        return gpu_instance
+        # Check if the instance is healthy after initialization
+        if is_gpu_healthy():
+            logger.info(f"GPU instance {node_hostname} is healthy and ready")
+            return gpu_instance
+        else:
+            logger.error(f"GPU instance {node_hostname} failed health check after initialization")
+            shutdown_gpu_instance()
+            return None
     else:
         logger.error("Failed to launch GPU instance")
         return None
 
 def shutdown_gpu_instance():
     """Shut down the current GPU instance"""
-    global gpu_instance, gpu_monitor_active
+    global gpu_instance, gpu_monitor_active, current_job_id, current_job_data
     
     if gpu_instance is None:
         return
     
     node_hostname = gpu_instance.get('node')
     node_id = gpu_instance.get('workload')
+    
+    # Reset job tracking
+    current_job_id = None
+    current_job_data = None
+    
+    # Stop GPU monitoring
+    gpu_monitor_active = False
     
     logger.info(f"Shutting down GPU instance {node_hostname} (ID: {node_id})...")
     result = stop_workload(node_id)
@@ -226,7 +306,213 @@ def shutdown_gpu_instance():
     
     # Reset GPU instance state
     gpu_instance = None
-    gpu_monitor_active = False
+
+def split_text_into_sentences(text):
+    """
+    Split text into individual sentences for better CSM processing.
+    
+    This improves the quality of speech generation by allowing
+    the model to handle each sentence as a separate unit.
+    """
+    # Basic sentence splitting using regex
+    # This handles periods, question marks, and exclamation marks followed by a space or end of text
+    sentences = re.split(r'(?<=[.!?])\s+|(?<=[.!?])$', text)
+    
+    # Filter out empty sentences
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    logger.info(f"Split text into {len(sentences)} sentences")
+    return sentences
+
+def text_to_speech_with_csm(text, job_id):
+    """Generate speech from text using CSM with configurable voice options"""
+    logger.info(f"Generating speech with CSM: {text[:50]}...")
+    
+    # Extract job parameters
+    job_data = redis_client.hgetall(f"job:{job_id}")
+    job_params = json.loads(job_data.get("data", "{}"))
+    
+    # Get CSM-specific parameters with defaults
+    voice = job_params.get("voice", "random")  # Options: random, conversational_a, conversational_b, or "clone" for voice cloning
+    
+    # Map API voice parameter to CSM internal parameter
+    csm_voice_map = {
+        "random": "random_voice",
+        "conversational_a": "conversational_a",
+        "conversational_b": "conversational_b",
+        "clone": "custom_voice"
+    }
+    
+    # Convert API voice name to CSM internal name
+    csm_voice = csm_voice_map.get(voice, "random_voice")
+    
+    temperature = float(job_params.get("temperature", 0.9))
+    topk = int(job_params.get("topk", 50))
+    max_audio_length = int(job_params.get("max_audio_length", 10000))
+    pause_duration = int(job_params.get("pause_duration", 150))
+    
+    # Voice cloning parameters
+    reference_audio_url = job_params.get("reference_audio_url")
+    reference_text = job_params.get("reference_text")
+    
+    # Get node hostname from GPU instance
+    node_hostname = gpu_instance.get('node')
+    
+    # Construct CSM endpoint URL using the node hostname
+    csm_url = f"https://{node_hostname}/csm/"
+    logger.info(f"Using CSM endpoint: {csm_url}")
+    
+    # Define retry parameters
+    max_retries = 5
+    retry_delay = 5  # seconds
+    
+    # Create Gradio client with retries
+    client = None
+    last_error = None
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"Attempt {attempt}/{max_retries} to connect to CSM service...")
+            
+            # Create Gradio client with API key header
+            client = Client(
+                csm_url,
+                headers={"X-C3-API-KEY": api_key}
+            )
+            
+            # If we get here, the client was created successfully
+            logger.info(f"Successfully connected to CSM service on attempt {attempt}")
+            break
+            
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Failed to connect to CSM service on attempt {attempt}: {str(e)}")
+            
+            # If this isn't the last attempt, wait before retrying
+            if attempt < max_retries:
+                logger.info(f"Waiting {retry_delay} seconds before retrying...")
+                time.sleep(retry_delay)
+    
+    # If we couldn't create the client after all retries, raise the last error
+    if client is None:
+        logger.error(f"Failed to connect to CSM service after {max_retries} attempts")
+        raise last_error
+    
+    try:
+        # Split text into sentences for better speech quality
+        sentences = split_text_into_sentences(text)
+        
+        # Prepare the monologue text as a JSON array of sentences
+        monologue_json = json.dumps(sentences)
+        
+        # Handle voice cloning if reference audio is provided
+        reference_audio_file = None
+        if voice == "clone" and reference_audio_url and reference_text:
+            # Download reference audio for voice cloning
+            logger.info(f"Downloading reference audio for voice cloning: {reference_audio_url}")
+            
+            try:
+                # Create a temporary file for the reference audio
+                reference_audio_file = os.path.join(OUTPUT_DIR, f"{job_id}_reference.mp3")
+                
+                # Download the reference audio
+                response = requests.get(reference_audio_url, timeout=30)
+                if response.status_code == 200:
+                    with open(reference_audio_file, 'wb') as f:
+                        f.write(response.content)
+                    logger.info(f"Downloaded reference audio to {reference_audio_file}")
+                else:
+                    logger.error(f"Failed to download reference audio: {response.status_code}")
+                    raise Exception(f"Failed to download reference audio: {response.status_code}")
+            except Exception as e:
+                logger.exception(f"Error downloading reference audio: {str(e)}")
+                raise
+        
+        # Log the CSM parameters
+        logger.info(f"CSM parameters: voice={voice}, temperature={temperature}, topk={topk}, " +
+                   f"max_audio_length={max_audio_length}, pause_duration={pause_duration}")
+        if voice == "clone":
+            logger.info(f"Voice cloning parameters: reference_audio_url={reference_audio_url}, " +
+                       f"reference_text={reference_text}")
+        
+        # Generate speech using the monologue mode with specified parameters
+        logger.info(f"Calling CSM with {voice} and {len(sentences)} sentences...")
+        
+        # Parameters for prediction
+        predict_params = {
+            "monologue_json": monologue_json,
+            "temperature": temperature,
+            "topk": topk,
+            "max_audio_length": max_audio_length,
+            "pause_duration": pause_duration,
+            "api_name": "/generate_monologue_audio"
+        }
+        
+        # Configure voice parameters based on type
+        if voice == "clone" and reference_audio_file:
+            # Use custom voice with reference audio and text
+            predict_params["speaker_voice"] = "custom_voice"
+            predict_params["speaker_text"] = reference_text
+            predict_params["speaker_audio"] = reference_audio_file
+        else:
+            # Use built-in voice options (random or conversational)
+            predict_params["speaker_voice"] = csm_voice
+            predict_params["speaker_text"] = ""
+            predict_params["speaker_audio"] = None
+        
+        # Call the CSM service to generate audio
+        result = client.predict(**predict_params)
+        
+        # Result is a file path to the generated audio
+        logger.info(f"CSM successfully generated audio: {result}")
+        
+        # Generate a filename using the job ID
+        filename = f"{job_id}.mp3"
+        output_path = os.path.join(OUTPUT_DIR, filename)
+        
+        # Copy the file to our output directory
+        with open(result, 'rb') as src_file, open(output_path, 'wb') as dest_file:
+            dest_file.write(src_file.read())
+        
+        logger.info(f"Saved audio to {output_path}")
+        
+        # Clean up reference audio file if it exists
+        if reference_audio_file and os.path.exists(reference_audio_file):
+            os.unlink(reference_audio_file)
+            logger.info(f"Cleaned up reference audio file {reference_audio_file}")
+        
+        return output_path
+        
+    except Exception as e:
+        logger.exception(f"Error generating speech with CSM: {str(e)}")
+        
+        # Clean up reference audio file if it exists
+        if 'reference_audio_file' in locals() and reference_audio_file and os.path.exists(reference_audio_file):
+            os.unlink(reference_audio_file)
+            logger.info(f"Cleaned up reference audio file {reference_audio_file}")
+            
+        raise
+
+def upload_to_storage(file_path):
+    """Save file to storage and return the URL"""
+    logger.info(f"Saving file to output directory: {file_path}")
+    
+    try:
+        # Just return the local file path for now
+        # In a real environment, this would be replaced with actual storage upload
+        # and returning a publicly accessible URL
+        
+        # For development, construct a placeholder URL
+        filename = os.path.basename(file_path)
+        result_url = f"file://{file_path}"
+        logger.info(f"File saved. URL: {result_url}")
+        
+        return result_url
+        
+    except Exception as e:
+        logger.exception(f"Unexpected error during file handling: {str(e)}")
+        # Return a fallback URL for now
+        return f"file://{file_path}"
 
 def send_webhook_notification(job_id, job_data, status, **kwargs):
     """Send webhook notification if URL is provided with retry logic"""
@@ -287,116 +573,204 @@ def send_webhook_notification(job_id, job_data, status, **kwargs):
 
 def process_csm_job(job_id, job_data):
     """Process a text-to-speech job"""
+    global current_job_id, current_job_data
+    
     logger.info(f"Processing CSM job: {job_id}")
     
-    # Extract job parameters
-    job_params = json.loads(job_data.get("data", "{}"))
-    text = job_params.get("text", "")
-    audio_url = job_params.get("audio_url")
-    audio_text = job_params.get("audio_text")
-    
-    logger.info(f"Job parameters: text='{text[:50]}...', audio_url={audio_url is not None}")
-    
-    # Get or create a GPU instance
-    instance = get_gpu_instance()
-    if not instance:
-        error_msg = "Failed to get GPU instance"
+    try:
+        # Extract job parameters
+        job_params = json.loads(job_data.get("data", "{}"))
+        
+        # For backward compatibility, support both 'text' and 'monologue'
+        monologue_text = job_params.get("monologue", job_params.get("text", ""))
+        
+        logger.info(f"Job parameters: monologue='{monologue_text[:50]}...'")
+        
+        # Get or create a GPU instance
+        instance = get_gpu_instance()
+        if not instance:
+            error_msg = "Failed to get GPU instance"
+            update_job_status(job_id, "failed", error=error_msg)
+            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+            return
+        
+        # Set current job for monitoring
+        current_job_id = job_id
+        current_job_data = job_data
+        
+        # Generate speech from text using CSM
+        audio_file = text_to_speech_with_csm(monologue_text, job_id)
+        
+        # Save the output path (we're not uploading to Minio yet)
+        result_url = upload_to_storage(audio_file)
+        
+        # Update job status and send notification
+        update_job_status(job_id, "success", result_url=result_url)
+        send_webhook_notification(job_id, job_data, "success", result_url=result_url, local_path=audio_file)
+        
+        # Note: We're not cleaning up the file since we want to keep it in the output directory
+        
+    except Exception as e:
+        error_msg = f"Error processing CSM job: {str(e)}"
+        logger.exception(error_msg)
         update_job_status(job_id, "failed", error=error_msg)
         send_webhook_notification(job_id, job_data, "failed", error=error_msg)
-        return
-    
-    # TODO: Connect to Gradio client for text-to-speech processing
-    # TODO: If audio_url is present, use it for voice cloning
-    # TODO: Store result in Minio/S3
-    
-    # For now, just simulate success
-    result_url = "https://example.com/results/sample.mp3"
-    update_job_status(job_id, "success", result_url=result_url)
-    send_webhook_notification(job_id, job_data, "success", result_url=result_url)
-    
+        # Shut down GPU instance on job failure
+        shutdown_gpu_instance()
+    finally:
+        # Clear job tracking
+        current_job_id = None
+        current_job_data = None
+
 def process_whisper_job(job_id, job_data):
     """Process a speech-to-text job"""
+    global current_job_id, current_job_data
+    
     logger.info(f"Processing Whisper job: {job_id}")
     
-    # Extract job parameters
-    job_params = json.loads(job_data.get("data", "{}"))
-    audio_url = job_params.get("audio_url")
-    model = job_params.get("model", "medium")
-    
-    logger.info(f"Job parameters: audio_url={audio_url}, model={model}")
-    
-    # Get or create a GPU instance
-    instance = get_gpu_instance()
-    if not instance:
-        error_msg = "Failed to get GPU instance"
+    try:
+        # Extract job parameters
+        job_params = json.loads(job_data.get("data", "{}"))
+        audio_url = job_params.get("audio_url")
+        model = job_params.get("model", "medium")
+        
+        logger.info(f"Job parameters: audio_url={audio_url}, model={model}")
+        
+        # Get or create a GPU instance
+        instance = get_gpu_instance()
+        if not instance:
+            error_msg = "Failed to get GPU instance"
+            update_job_status(job_id, "failed", error=error_msg)
+            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+            return
+        
+        # Set current job for monitoring
+        current_job_id = job_id
+        current_job_data = job_data
+        
+        # TODO: Connect to Gradio client for speech-to-text processing
+        # TODO: Download audio from URL to output directory with job ID filename
+        # output_path = os.path.join(OUTPUT_DIR, f"{job_id}_input.mp3")
+        # TODO: Process with Whisper model
+        # TODO: Save results to output directory with job ID filename
+        # text_output_path = os.path.join(OUTPUT_DIR, f"{job_id}.txt")
+        
+        # For now, just simulate success
+        result_text = "This is a simulated transcription result"
+        update_job_status(job_id, "success", result=result_text)
+        send_webhook_notification(job_id, job_data, "success", text=result_text)
+        
+    except Exception as e:
+        error_msg = f"Error processing Whisper job: {str(e)}"
+        logger.exception(error_msg)
         update_job_status(job_id, "failed", error=error_msg)
         send_webhook_notification(job_id, job_data, "failed", error=error_msg)
-        return
-    
-    # TODO: Connect to Gradio client for speech-to-text processing
-    # TODO: Download audio from URL
-    # TODO: Process with Whisper model
-    
-    # For now, just simulate success
-    result_text = "This is a simulated transcription result"
-    update_job_status(job_id, "success", result=result_text)
-    send_webhook_notification(job_id, job_data, "success", text=result_text)
+        # Shut down GPU instance on job failure
+        shutdown_gpu_instance()
+    finally:
+        # Clear job tracking
+        current_job_id = None
+        current_job_data = None
 
 def process_portrait_job(job_id, job_data):
     """Process a portrait video job"""
+    global current_job_id, current_job_data
+    
     logger.info(f"Processing Portrait job: {job_id}")
     
-    # Extract job parameters
-    job_params = json.loads(job_data.get("data", "{}"))
-    image_url = job_params.get("image_url")
-    audio_url = job_params.get("audio_url")
-    
-    logger.info(f"Job parameters: image_url={image_url}, audio_url={audio_url}")
-    
-    # Get or create a GPU instance
-    instance = get_gpu_instance()
-    if not instance:
-        error_msg = "Failed to get GPU instance"
+    try:
+        # Extract job parameters
+        job_params = json.loads(job_data.get("data", "{}"))
+        image_url = job_params.get("image_url")
+        audio_url = job_params.get("audio_url")
+        
+        logger.info(f"Job parameters: image_url={image_url}, audio_url={audio_url}")
+        
+        # Get or create a GPU instance
+        instance = get_gpu_instance()
+        if not instance:
+            error_msg = "Failed to get GPU instance"
+            update_job_status(job_id, "failed", error=error_msg)
+            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+            return
+        
+        # Set current job for monitoring
+        current_job_id = job_id
+        current_job_data = job_data
+        
+        # TODO: Connect to ComfyUI for video generation
+        # TODO: Download image and audio from URLs to output directory with job ID filename
+        # image_output_path = os.path.join(OUTPUT_DIR, f"{job_id}_image.jpg")
+        # audio_output_path = os.path.join(OUTPUT_DIR, f"{job_id}_audio.mp3")
+        # TODO: Run portrait generation workflow
+        # TODO: Save result to output directory with job ID filename
+        # video_output_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
+        
+        # For now, just simulate success
+        result_url = f"file://{OUTPUT_DIR}/{job_id}.mp4"
+        update_job_status(job_id, "success", result_url=result_url)
+        send_webhook_notification(job_id, job_data, "success", result_url=result_url)
+        
+    except Exception as e:
+        error_msg = f"Error processing Portrait job: {str(e)}"
+        logger.exception(error_msg)
         update_job_status(job_id, "failed", error=error_msg)
         send_webhook_notification(job_id, job_data, "failed", error=error_msg)
-        return
-    
-    # TODO: Connect to ComfyUI for video generation
-    # TODO: Download image and audio from URLs
-    # TODO: Run portrait generation workflow
-    # TODO: Store result in Minio/S3
-    
-    # For now, just simulate success
-    result_url = "https://example.com/results/portrait.mp4"
-    update_job_status(job_id, "success", result_url=result_url)
-    send_webhook_notification(job_id, job_data, "success", result_url=result_url)
+        # Shut down GPU instance on job failure
+        shutdown_gpu_instance()
+    finally:
+        # Clear job tracking
+        current_job_id = None
+        current_job_data = None
 
 def process_analyze_job(job_id, job_data):
     """Process an image analysis job"""
+    global current_job_id, current_job_data
+    
     logger.info(f"Processing Analyze job: {job_id}")
     
-    # Extract job parameters
-    job_params = json.loads(job_data.get("data", "{}"))
-    image_url = job_params.get("image_url")
-    
-    logger.info(f"Job parameters: image_url={image_url}")
-    
-    # Get or create a GPU instance
-    instance = get_gpu_instance()
-    if not instance:
-        error_msg = "Failed to get GPU instance"
+    try:
+        # Extract job parameters
+        job_params = json.loads(job_data.get("data", "{}"))
+        image_url = job_params.get("image_url")
+        
+        logger.info(f"Job parameters: image_url={image_url}")
+        
+        # Get or create a GPU instance
+        instance = get_gpu_instance()
+        if not instance:
+            error_msg = "Failed to get GPU instance"
+            update_job_status(job_id, "failed", error=error_msg)
+            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+            return
+        
+        # Set current job for monitoring
+        current_job_id = job_id
+        current_job_data = job_data
+        
+        # TODO: Connect to vision model API
+        # TODO: Download image from URL to output directory with job ID filename
+        # image_output_path = os.path.join(OUTPUT_DIR, f"{job_id}_input.jpg")
+        # TODO: Process with vision model
+        # TODO: Save results to output directory with job ID filename
+        # text_output_path = os.path.join(OUTPUT_DIR, f"{job_id}.txt")
+        
+        # For now, just simulate success
+        result_text = "This is a simulated image analysis result"
+        update_job_status(job_id, "success", result=result_text)
+        send_webhook_notification(job_id, job_data, "success", text=result_text)
+        
+    except Exception as e:
+        error_msg = f"Error processing Analyze job: {str(e)}"
+        logger.exception(error_msg)
         update_job_status(job_id, "failed", error=error_msg)
         send_webhook_notification(job_id, job_data, "failed", error=error_msg)
-        return
-    
-    # TODO: Connect to vision model API
-    # TODO: Download image from URL
-    # TODO: Process with vision model
-    
-    # For now, just simulate success
-    result_text = "This is a simulated image analysis result"
-    update_job_status(job_id, "success", result=result_text)
-    send_webhook_notification(job_id, job_data, "success", text=result_text)
+        # Shut down GPU instance on job failure
+        shutdown_gpu_instance()
+    finally:
+        # Clear job tracking
+        current_job_id = None
+        current_job_data = None
 
 def update_job_status(job_id, status, **kwargs):
     """Update job status in Redis"""
@@ -440,13 +814,15 @@ def process_job(job_id):
             redis_client.hset(f"job:{job_id}", "status", "failed")
             redis_client.hset(f"job:{job_id}", "error", error_msg)
             send_webhook_notification(job_id, job_data, "failed", error=error_msg)
-    
+            
     except Exception as e:
         error_msg = f"Error processing job: {str(e)}"
         logger.exception(error_msg)
         redis_client.hset(f"job:{job_id}", "status", "failed")
         redis_client.hset(f"job:{job_id}", "error", error_msg)
         send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+        # Shut down GPU instance on job failure
+        shutdown_gpu_instance()
 
 def main():
     """Main worker loop"""
