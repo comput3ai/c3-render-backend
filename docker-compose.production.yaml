@@ -1,75 +1,57 @@
-version: '3.8'
+version: '3'
+
 services:
-  api:
-    build:
-      context: .
-      dockerfile: c3_render_api/Dockerfile
-    ports:
-      - "5000:5000"
-    environment:
-      - REDIS_HOST=${REDIS_HOST}
-      - REDIS_PORT=${REDIS_PORT}
-      - PORT=${PORT}
-    restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./c3_render_api:/app/c3_render_api
-    networks:
-      - c3render
-      - traefik-net
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.render-api.rule=Host(`${RENDER_HOSTNAME:-render.comput3.ai}`)"
-      - "traefik.http.routers.render-api.entrypoints=websecure"
-      - "traefik.http.routers.render-api.tls=true"
-      - "traefik.http.services.render-api.loadbalancer.server.port=${PORT:-5000}"
-  worker:
-    build:
-      context: .
-      dockerfile: c3_render_worker/Dockerfile
-    environment:
-      - REDIS_HOST=${REDIS_HOST}
-      - REDIS_PORT=${REDIS_PORT}
-      - C3_API_KEY=${C3_API_KEY}
-      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
-      - MINIO_SECURE=${MINIO_SECURE}
-    restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./c3_render_worker:/app/c3_render_worker
-      - ./output:/app/output
-    networks:
-      - c3render
-    deploy:
-      replicas: ${WORKER_REPLICAS:-1}
+  # Redis service for job queue
   redis:
-    image: redis:7.2-alpine
-    ports:
-      - "6379:6379"
+    image: redis:7-alpine
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
-      timeout: 5s
+      timeout: 3s
       retries: 5
-    networks:
-      - c3render
 
-networks:
-  c3render:
-    driver: bridge
-  traefik-net:
-    name: traefik-net
-    external: true
+  # API service with explicit context
+  api:
+    build:
+      context: ./c3_render_api
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - API_KEY=${API_KEY}
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  # Worker service with explicit context
+  worker:
+    build:
+      context: ./c3_render_worker
+      dockerfile: Dockerfile
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - C3_API_KEY=${C3_API_KEY}
+      - OUTPUT_DIR=/app/output
+      - MINIO_HOST=${MINIO_HOST}
+      - MINIO_BUCKET=${MINIO_BUCKET}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_SECURE=${MINIO_SECURE:-false}
+      - MINIO_PUBLIC_URL=${MINIO_PUBLIC_URL}
+    volumes:
+      - worker_output:/app/output
+    depends_on:
+      - redis
+    restart: unless-stopped
+    deploy:
+      replicas: 3
 
 volumes:
   redis_data:
+  worker_output:
