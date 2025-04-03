@@ -3,7 +3,7 @@ FROM python:3.13-slim
 WORKDIR /app
 
 # Install dependencies
-COPY c3_render_api/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # For production, copy the API code
