@@ -155,10 +155,11 @@ curl -X POST http://localhost:5000/csm \
   }'
 ```
 
-Response:
+#### Example Response
+
 ```json
 {
-  "job_id": "c1e8f9a0-1b2c-4d3e-9f4g-5h6i7j8k9l0m",
+  "id": "c1e8f9a0-1b2c-4d3e-9f4g-5h6i7j8k9l0m",
   "status": "queued"
 }
 ```
@@ -202,12 +203,21 @@ POST /api/v1/jobs/whisper
 
 #### cURL Example
 ```bash
+# Basic whisper request
 curl -X POST http://localhost:5000/api/v1/jobs/whisper \
   -H "Content-Type: application/json" \
   -d '{
-    "audio_url": "https://storage.example.com/recording.mp3",
+    "audio_url": "https://example.com/path/to/audio.mp3",
+    "notify_url": "https://your-webhook-endpoint.com/callback"
+  }'
+
+# Whisper request with model specification
+curl -X POST http://localhost:5000/api/v1/jobs/whisper \
+  -H "Content-Type: application/json" \
+  -d '{
+    "audio_url": "https://example.com/path/to/audio.mp3",
     "model": "large",
-    "notify_url": "https://myapp.example.com/webhooks/job-complete"
+    "notify_url": "https://your-webhook-endpoint.com/callback"
   }'
 ```
 
@@ -225,6 +235,25 @@ POST /portrait
   "image_url": "https://storage.example.com/portrait.jpg",
   "audio_url": "https://storage.example.com/speech.mp3",
   "notify_url": "https://myapp.example.com/webhooks/job-complete"  // Optional
+}
+```
+
+#### Example Curl Command
+```bash
+curl -X POST http://localhost:5000/portrait \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_url": "https://example.com/path/to/portrait.jpg",
+    "audio_url": "https://example.com/path/to/audio.mp3",
+    "notify_url": "https://your-webhook-endpoint.com/callback"
+  }'
+```
+
+#### Example Response
+```json
+{
+  "id": "c1e8f9a0-1b2c-4d3e-9f4g-5h6i7j8k9l0m",
+  "status": "queued"
 }
 ```
 
@@ -291,9 +320,17 @@ POST /analyze
 curl -X POST http://localhost:5000/analyze \
   -H "Content-Type: application/json" \
   -d '{
-    "image_url": "https://storage.example.com/image.jpg",
-    "notify_url": "https://myapp.example.com/webhooks/job-complete"
+    "image_url": "https://example.com/path/to/image.jpg",
+    "notify_url": "https://your-webhook-endpoint.com/callback"
   }'
+```
+
+#### Example Response
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440003",
+  "status": "queued"
+}
 ```
 
 ### Job Status
@@ -306,7 +343,18 @@ GET /status/{id}
 
 #### cURL Example
 ```bash
+# Replace JOB_ID with the actual job ID returned when submitting a job
+curl -X GET http://localhost:5000/status/JOB_ID
+
+# Example with an actual UUID
 curl -X GET http://localhost:5000/status/550e8400-e29b-41d4-a716-446655440000
+```
+
+#### Example Response
+```json
+{
+  "status": "queued"  // Possible values: "queued", "running", "success", "failed"
+}
 ```
 
 ### Job Result
@@ -319,7 +367,25 @@ GET /result/{id}
 
 #### cURL Example
 ```bash
+# Replace JOB_ID with the actual job ID returned when submitting a job
+curl -X GET http://localhost:5000/result/JOB_ID
+
+# Example with an actual UUID
 curl -X GET http://localhost:5000/result/550e8400-e29b-41d4-a716-446655440000
+```
+
+#### Example Response for Media Jobs (CSM, Portrait)
+```json
+{
+  "result_url": "https://storage.example.com/results/JOB_ID.mp4"
+}
+```
+
+#### Example Response for Text Jobs (Whisper, Analyze)
+```json
+{
+  "text": "The transcribed text or analysis result"
+}
 ```
 
 ## Webhook Notifications
