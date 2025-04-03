@@ -1,21 +1,23 @@
-# GPU AI Rendering Queue API Documentation
+# C3 Render Service Specification
 
 This API provides batch processing capabilities for various AI rendering tasks including text-to-speech, speech-to-text, portrait video generation, and image analysis.
 
-### Implementation Notes
+## System Architecture
 
-- System intentionally avoids complex class hierarchies or abstractions
-- Jobs tracked by UUIDs in Redis
-- API designed for simplicity and ease of integration
-- Comput3.ai API functions integrated directly into worker
-- Single unified job queue for all job types
-- Robust webhook notification system with 5 retry attempts
+The C3 Render system consists of three main components:
 
-## Base URL
+1. **API Server**: A Flask application that handles client requests
+2. **Worker**: A Python service that processes jobs using Comput3.ai GPU instances
+3. **Redis**: A message queue and job data store
 
-```
-https://api.example.com/api/v0
-```
+### Workflow
+
+1. Client submits a job via the API
+2. API validates the request, generates a job ID, and adds the job to the queue
+3. Worker pulls jobs from the queue and processes them
+4. Worker uses Comput3.ai GPU instances to execute the job
+5. Worker updates job status in Redis and sends webhook notifications
+6. Client can check job status or retrieve results via the API
 
 ## Implementation Details
 
@@ -27,6 +29,16 @@ https://api.example.com/api/v0
 - **GPU Processing**: Gradio clients for AI model interaction, ComfyUI for video workflows
 - **GPU Resources**: Comput3.ai for on-demand GPU instances ("media:fast" workload type)
 - **Containerization**: Simple Docker Compose setup
+
+### Worker Architecture
+
+The worker component has been refactored into a modular design:
+
+1. **c3_render_worker.py**: Main worker file that handles job queue and dispatching
+2. **csm.py**: Module for text-to-speech generation using CSM
+3. **comfyui.py**: Module for portrait video generation using ComfyUI
+
+This modular approach improves code organization, maintainability, and makes it easier to add new job types in the future.
 
 ### GPU Instance Management
 
@@ -42,7 +54,7 @@ The worker component has direct integration with the Comput3.ai API for GPU inst
 2. **Worker implementation pattern**:
    - Worker pulls job from a single Redis queue
    - Uses integrated functions to provision a GPU instance (reuses existing instance if available)
-   - Processes the job on the instance (via Gradio or ComfyUI)
+   - Processes the job on the instance (via Gradio for CSM or ComfyUI for portraits)
    - Updates job status in Redis
    - Sends webhook notifications with retry logic
    - Maintains GPU instances for 5 minutes of idle time before shutdown
@@ -55,277 +67,147 @@ The worker component has direct integration with the Comput3.ai API for GPU inst
    - Handles instance failures gracefully and updates job status accordingly
    - Includes 5 retry attempts for webhook notifications with 5-second intervals
 
-### Implementation Approach
+## API Endpoints
 
-The implementation is deliberately kept minimal and straightforward:
-
-#### API Server
-- Single Flask application file that defines all endpoints
-- Simple JSON validation for requests
-- Redis for job queuing and status tracking
-- No direct use of Minio or GPU resources
-
-#### Worker Process
-- Basic script that pulls jobs from a single Redis queue
-- Has integrated Comput3.ai API functions for GPU instance management
-- Implements intelligent GPU instance management with idle timeout
-- Includes robust webhook notification system
-- Handles multiple job types from a single queue
-
-#### File Storage
-- Uses client-provided URLs directly to download resources for processing
-- Results to be stored in Minio/S3 with shareable URLs
-- Workers will handle all storage operations
-
-#### GPU Processing
-- Workers use Gradio clients to interact with AI models for text and audio tasks
-- Video tasks (portrait) use ComfyUI workflow JSONs with the requests library
-- Models are accessed through interfaces running on Comput3.ai instances
-- Instances are kept alive between jobs to maximize efficiency
-
-### Kubernetes Deployment
-
-The system can be deployed to Kubernetes with the following components:
-
-#### Kubernetes Resources
-1. **Flask API Deployment/Service**: Handles all API endpoints, generates job IDs, and adds jobs to Redis
-2. **Redis StatefulSet/Service**: Manages job queue and stores job status information
-3. **Worker Deployment**: Processes jobs from Redis, launches GPU instances, and updates job status
-
-These components interact within the Kubernetes cluster:
-- The API service receives requests and places them in Redis
-- Worker pods pick up jobs from Redis and process them
-- Results are stored in Minio and URLs are updated in Redis
-
-Kubernetes provides several advantages for this architecture:
-- Horizontal scaling of worker pods based on queue depth
-- Health checks and automatic restarts of failed components
-- Resource allocation and limits for stable operation
-- Rolling updates for zero-downtime deployments
-
-## Endpoints
-
-### Text-to-Speech (CSM Model)
-
-Generate speech from text, with optional voice cloning.
+### Text-to-Speech (CSM)
 
 ```
 POST /csm
 ```
 
-#### Request Body
+Generate speech from text using CSM (Collaborative Speech Model).
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| text | string | Yes | The text to convert to speech |
-| audio_url | string | No | URL to audio file for voice cloning |
-| audio_text | string | No* | Text content of the audio file (*required if audio_url is provided) |
+#### Request Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| monologue | string | Yes | The text to convert to speech |
+| voice | string | No | Voice type (random, conversational_a, conversational_b, clone) |
+| reference_audio_url | string | For voice=clone | URL to reference audio file for voice cloning |
+| reference_text | string | For voice=clone | Text content of the reference audio |
+| temperature | float | No | Controls randomness of output (0.0-2.0) |
+| topk | integer | No | Tokens to consider at each generation step |
+| max_audio_length | integer | No | Maximum audio length in milliseconds |
+| pause_duration | integer | No | Duration of pauses between sentences |
 | notify_url | string | No | Webhook URL for job completion notification |
-
-#### Example Request
-
-```json
-{
-  "text": "Hello world, this is a test of the text to speech system.",
-  "audio_url": "https://storage.example.com/sample-voice.mp3",
-  "audio_text": "Hello, my name is John and this is my voice sample.",
-  "notify_url": "https://myapp.example.com/webhooks/job-complete"
-}
-```
-
-#### Response
-
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
-
-### Speech-to-Text (Whisper)
-
-Transcribe audio to text.
-
-```
-POST /whisper
-```
-
-#### Request Body
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| audio_url | string | Yes | URL to the audio file for transcription |
-| model | string | No | Model to use for transcription (defaults to "medium") |
-| notify_url | string | No | Webhook URL for job completion notification |
-
-#### Example Request
-
-```json
-{
-  "audio_url": "https://storage.example.com/recording.mp3",
-  "model": "large",
-  "notify_url": "https://myapp.example.com/webhooks/job-complete"
-}
-```
-
-#### Response
-
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440001"
-}
-```
 
 ### Portrait Video Generation
-
-Create a speaking portrait video from an image and audio.
 
 ```
 POST /portrait
 ```
 
-#### Request Body
+Create a talking head video from a portrait image and audio.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| image_url | string | Yes | URL to the image to animate |
-| audio_url | string | No | URL to the audio for the portrait to speak (generates random voice if not provided) |
+#### Request Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| image_url | string | Yes | URL to the portrait image |
+| audio_url | string | Yes | URL to the audio file |
 | notify_url | string | No | Webhook URL for job completion notification |
 
-#### Example Request
+### Speech-to-Text (Whisper)
 
-```json
-{
-  "image_url": "https://storage.example.com/portrait.jpg",
-  "audio_url": "https://storage.example.com/speech.mp3",
-  "notify_url": "https://myapp.example.com/webhooks/job-complete"
-}
+```
+POST /api/v1/jobs/whisper
 ```
 
-#### Response
+Transcribe audio to text using Whisper.
 
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440002"
-}
-```
+#### Request Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| audio_url | string | Yes | URL to the audio file |
+| model | string | No | Whisper model size (default: medium) |
+| notify_url | string | No | Webhook URL for job completion notification |
 
 ### Image Analysis
-
-Analyze an image using a vision model.
 
 ```
 POST /analyze
 ```
 
-#### Request Body
+Analyze an image using vision models.
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| image_url | string | Yes | URL to the image to be analyzed |
+#### Request Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| image_url | string | Yes | URL to the image |
 | notify_url | string | No | Webhook URL for job completion notification |
-
-#### Example Request
-
-```json
-{
-  "image_url": "https://storage.example.com/image.jpg",
-  "notify_url": "https://myapp.example.com/webhooks/job-complete"
-}
-```
-
-#### Response
-
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440003"
-}
-```
 
 ### Job Status
 
-Check the status of a submitted job.
-
 ```
-GET /status/{id}
+GET /status/{job_id}
 ```
 
-#### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| id | string | **Required.** The UUID of the job |
-
-#### Response
-
-```json
-{
-  "status": "queued" // Possible values: "queued", "running", "failed", "success"
-}
-```
+Get the current status of a job.
 
 ### Job Result
 
+```
+GET /result/{job_id}
+```
+
 Retrieve the result of a completed job.
 
-```
-GET /result/{id}
-```
+## Job Types and Processing
 
-#### Parameters
+### CSM (Text-to-Speech)
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| id | string | **Required.** The UUID of the job |
+The CSM module (csm.py) handles text-to-speech generation:
 
-#### Response
+1. Downloads reference audio if voice cloning is requested
+2. Splits input text into sentences for better processing
+3. Connects to CSM service on Comput3.ai GPU instance
+4. Configures voice parameters based on request
+5. Generates speech audio file
+6. Returns path to generated audio file
 
-For text-based results (like /whisper or /analyze):
-```json
-{
-  "text": "The transcription or analysis result text"
-}
-```
+### ComfyUI (Portrait Video Generation)
 
-For media-based results (like /csm or /portrait):
-```json
-{
-  "result_url": "https://storage.example.com/results/550e8400-e29b-41d4-a716-446655440003.mp4"
-}
-```
+The ComfyUI module (comfyui.py) handles portrait video generation:
+
+1. Downloads portrait image and audio files
+2. Uploads files to ComfyUI running on Comput3.ai GPU instance
+3. Configures and runs the SONIC animation workflow
+4. Monitors workflow execution
+5. Downloads the generated video
+6. Returns path to generated video file
 
 ## Webhook Notifications
 
-When a job completes and a `notify_url` was provided, the worker will send a POST request to the specified URL with the following payload:
+When a job completes and a `notify_url` is provided, the system sends a webhook with the following fields:
 
-For successful jobs:
+### Success (Media Jobs)
 ```json
 {
-  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "id": "job_id",
   "status": "success",
-  "result_url": "https://example.com/results/output.mp4"  // for media jobs (csm, portrait)
+  "result_url": "https://example.com/results/output.mp4"
 }
 ```
 
-or
-
+### Success (Text Jobs)
 ```json
 {
-  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "id": "job_id",
   "status": "success",
-  "text": "Result text for text-based outputs"  // for text jobs (whisper, analyze)
+  "text": "Transcription or analysis result text"
 }
 ```
 
-For failed jobs:
+### Failure
 ```json
 {
-  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "id": "job_id",
   "status": "failed",
-  "error": "Error message describing what went wrong"
+  "error": "Error message"
 }
 ```
-
-The webhook will only include fields that are relevant to the specific job type and status. Text-based jobs (whisper, analyze) will include a `text` field with the result, while media-based jobs (csm, portrait) will include a `result_url` field pointing to the generated media file.
 
 ### Webhook Reliability
 
@@ -334,3 +216,24 @@ The system implements a robust notification mechanism:
 - 5-second intervals between retry attempts
 - Detailed logging of webhook delivery attempts
 - Graceful handling of webhook failures
+
+## File Storage
+
+All output files are stored in the configured output directory, with the following naming convention:
+
+- Text-to-speech: `{job_id}.mp3`
+- Portrait video: `{job_id}.mp4`
+- Speech-to-text input: `{job_id}_input.mp3`
+- Speech-to-text output: `{job_id}.txt`
+- Image analysis input: `{job_id}_input.jpg`
+- Image analysis output: `{job_id}.txt`
+
+## Implementation Notes
+
+- System intentionally avoids complex class hierarchies or abstractions
+- Jobs tracked by UUIDs in Redis
+- API designed for simplicity and ease of integration
+- Comput3.ai API functions integrated directly into worker
+- Single unified job queue for all job types
+- Robust webhook notification system with 5 retry attempts
+- Modular codebase with separate files for CSM and ComfyUI integrations

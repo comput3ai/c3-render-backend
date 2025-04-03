@@ -95,6 +95,7 @@ python c3_render_worker.py
 - **Webhook Notifications**: Workers send webhook notifications with 5 retry attempts at 5-second intervals
 - **Job Status Tracking**: All job status information is stored in Redis
 - **Storage**: Uses Minio S3-compatible storage for storing job results (configured via environment variables)
+- **Modular Design**: Worker functionality is separated into task-specific modules (csm.py, comfyui.py)
 
 ## API Endpoints
 
@@ -102,10 +103,24 @@ python c3_render_worker.py
 Generate speech using the CSM (Collaborative Speech Model) text-to-speech system with configurable voice options, including voice cloning.
 
 ```bash
+# Basic text-to-speech request
 curl -X POST http://localhost:5000/csm \
   -H "Content-Type: application/json" \
   -d '{
     "monologue": "Hello, this is a test of the C3 Render API text to speech system using CSM.",
+    "notify_url": "https://your-webhook-endpoint.com/callback"
+  }'
+
+# Text-to-speech with voice customization
+curl -X POST http://localhost:5000/csm \
+  -H "Content-Type: application/json" \
+  -d '{
+    "monologue": "This example uses the conversational voice type A with custom temperature and other parameters.",
+    "voice": "conversational_a",
+    "temperature": 0.7,
+    "topk": 40,
+    "max_audio_length": 8000,
+    "pause_duration": 200,
     "notify_url": "https://your-webhook-endpoint.com/callback"
   }'
 ```
@@ -385,31 +400,7 @@ The system is designed to be simple and maintainable:
 - GPU instances are reused between jobs (with 5-minute idle timeout)
 - Workers handle webhook notifications with retry logic
 - Clear separation between API (job submission) and worker (job processing)
-
-## TODOs
-
-The following features are planned for implementation:
-
-### Worker Implementation
-- [ ] Connect to Gradio clients for text-to-speech processing (CSM)
-- [ ] Implement voice cloning with audio_url and audio_text
-- [ ] Connect to Gradio clients for speech-to-text processing (Whisper)
-- [ ] Connect to ComfyUI for portrait video generation
-- [ ] Implement image analysis with vision models
-- [ ] Store results in Minio/S3
-- [ ] Improve failure handling:
-  - When a job fails during execution, shut down the GPU instance to save resources
-  - When a GPU becomes unhealthy during job execution, mark the job as failed and notify
-  - Implement regular health checks every 15 seconds during job execution
-
-### Infrastructure
-- [ ] Kubernetes deployment configuration
-- [ ] Worker horizontal scaling based on queue depth
-- [ ] Monitoring and alerting for job failures
-
-## License
-
-MIT 
+- Modular approach with separate files for CSM and ComfyUI integrations
 
 ## Project Structure
 
@@ -445,7 +436,7 @@ Files in the output directory are named using the job ID as follows:
 - Text-to-speech (CSM) output: `{job_id}.mp3`
 - Speech-to-text (Whisper) input: `{job_id}_input.mp3`
 - Speech-to-text (Whisper) output: `{job_id}.txt`
-- Portrait video generation image input: `{job_id}_image.jpg`
+- Portrait video generation image input: `{job_id}_portrait.jpg`
 - Portrait video generation audio input: `{job_id}_audio.mp3`
 - Portrait video generation output: `{job_id}.mp4`
 - Image analysis input: `{job_id}_input.jpg`
@@ -453,6 +444,6 @@ Files in the output directory are named using the job ID as follows:
 
 This naming convention ensures that files are easily traceable to their originating jobs and prevents file naming conflicts.
 
-## Local Development
+## License
 
-// ... existing code ... 
+MIT
