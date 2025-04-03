@@ -10,6 +10,7 @@ from redis import Redis
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlparse
+import time
 
 # Load environment variables
 load_dotenv()
@@ -32,6 +33,9 @@ redis_client = Redis(host=redis_host, port=redis_port, decode_responses=True)
 
 # Single job queue name
 JOB_QUEUE = "queue:jobs"
+
+# Get API key from environment variables
+C3_API_KEY = os.getenv("C3_API_KEY")
 
 def create_job(job_type: str, data: Dict[str, Any]) -> str:
     """Create a new job and add it to Redis queue"""
@@ -173,25 +177,26 @@ def validate_whisper_params(data: Dict[str, Any]) -> Tuple[bool, str]:
     
     return True, ""
 
-def validate_portrait_params(data: Dict[str, Any]) -> Tuple[bool, str]:
-    """Validate parameters for portrait video generation"""
-    # Check for required field
-    if not data or "image_url" not in data:
-        return False, "Missing required field: image_url"
+def validate_portrait_params(data: Dict[str, Any]) -> Dict[str, str]:
+    """Validate parameters for portrait job"""
+    required_fields = ["image_url", "audio_url"]
+    errors = {}
     
-    # Validate image_url
-    if not validate_url(data["image_url"]):
-        return False, "image_url must be a valid URL"
+    # Check for required fields
+    for field in required_fields:
+        if field not in data or not data[field]:
+            errors[field] = f"Missing required field: {field}"
     
-    # Validate audio_url if provided
-    if "audio_url" in data and not validate_url(data["audio_url"]):
-        return False, "audio_url must be a valid URL"
+    # Validate URLs
+    if "image_url" in data and data["image_url"]:
+        if not validate_url(data["image_url"]):
+            errors["image_url"] = "Invalid URL format for image_url"
     
-    # Validate notify_url if present
-    if "notify_url" in data and not validate_url(data["notify_url"]):
-        return False, "notify_url must be a valid URL"
+    if "audio_url" in data and data["audio_url"]:
+        if not validate_url(data["audio_url"]):
+            errors["audio_url"] = "Invalid URL format for audio_url"
     
-    return True, ""
+    return errors
 
 def validate_analyze_params(data: Dict[str, Any]) -> Tuple[bool, str]:
     """Validate parameters for image analysis"""
@@ -252,23 +257,35 @@ def speech_to_text():
         return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/portrait", methods=["POST"])
-def portrait_video():
-    """Portrait video generation endpoint"""
-    try:
-        data = request.get_json()
-        
-        # Validate input parameters
-        is_valid, error_message = validate_portrait_params(data)
-        if not is_valid:
-            return jsonify({"error": error_message}), 400
-        
-        # Create job after validation
-        job_id = create_job("portrait", data)
-        return jsonify({"id": job_id, "status": "queued"})
-        
-    except Exception as e:
-        logger.exception(f"Error processing Portrait request: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+def portrait_endpoint():
+    """Text-to-video portrait endpoint"""
+    # Get request data
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Missing request body"}), 400
+    
+    # Validate parameters
+    validation_errors = validate_portrait_params(data)
+    if validation_errors:
+        return jsonify({"errors": validation_errors}), 400
+    
+    # Generate a unique job ID
+    job_id = str(uuid.uuid4())
+    
+    # Store job in Redis
+    job_data = {
+        "id": job_id,
+        "type": "portrait",
+        "status": "queued",
+        "data": json.dumps(data),
+        "created_at": time.time()
+    }
+    
+    redis_client.hmset(f"job:{job_id}", job_data)
+    redis_client.rpush(JOB_QUEUE, job_id)
+    
+    # Return job ID
+    return jsonify({"id": job_id, "status": "queued"}), 200
 
 @app.route("/analyze", methods=["POST"])
 def image_analysis():

@@ -208,10 +208,18 @@ POST /portrait
 ```json
 {
   "image_url": "https://storage.example.com/portrait.jpg",
-  "audio_url": "https://storage.example.com/speech.mp3",  // Optional
+  "audio_url": "https://storage.example.com/speech.mp3",
   "notify_url": "https://myapp.example.com/webhooks/job-complete"  // Optional
 }
 ```
+
+#### Request Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **image_url** | string | Required | URL to the portrait image (face) to animate |
+| **audio_url** | string | Required | URL to the audio file that will be used to animate the portrait |
+| **notify_url** | string | Optional | Webhook URL to receive job status updates |
 
 #### cURL Example
 ```bash
@@ -223,6 +231,29 @@ curl -X POST http://localhost:5000/portrait \
     "notify_url": "https://myapp.example.com/webhooks/job-complete"
   }'
 ```
+
+Response:
+```json
+{
+  "id": "c1e8f9a0-1b2c-4d3e-9f4g-5h6i7j8k9l0m",
+  "status": "queued"
+}
+```
+
+#### Implementation Details
+
+Portrait video generation uses ComfyUI with the SONIC model to create animated talking face videos. The process:
+
+1. The worker downloads the provided image and audio files to the output directory
+2. ComfyUI's SONIC model processes the files to generate a talking face video that matches the audio
+3. The resulting MP4 video is saved to the output directory
+4. A webhook notification is sent upon completion with the URL to the generated video
+
+The implementation uses a specialized workflow with the following components:
+- ImageOnlyCheckpointLoader: Loads the SVD_XT model for image animation
+- SONIC_PreData: Prepares the input data for the SONIC model
+- SONICSampler: Generates the animated frames based on audio input
+- VHS_VideoCombine: Combines the frames with the audio to create the final video
 
 ### Image Analysis
 

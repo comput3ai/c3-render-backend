@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from gradio_client import Client
 import re
+from urllib.parse import urlparse
 
 # Load environment variables
 load_dotenv()
@@ -672,8 +673,88 @@ def process_whisper_job(job_id, job_data):
         current_job_id = None
         current_job_data = None
 
+def download_file(url, output_path=None, preserve_extension=True):
+    """Download a file from URL to the specified path
+    
+    Args:
+        url: URL to download
+        output_path: Path to save the file (if preserve_extension is True, the extension may be changed)
+        preserve_extension: Whether to preserve the file extension from the URL
+        
+    Returns:
+        The path to the downloaded file or False if download failed
+    """
+    logger.info(f"Downloading file from {url}")
+    
+    try:
+        if preserve_extension and output_path:
+            # Extract the extension from the URL
+            url_path = urlparse(url).path
+            _, ext = os.path.splitext(url_path)
+            
+            if ext:
+                # Replace the extension in the output path
+                output_base, _ = os.path.splitext(output_path)
+                output_path = output_base + ext
+                logger.info(f"Using extension from URL: {ext}")
+        
+        logger.info(f"Saving to {output_path}")
+        
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            with open(output_path, 'wb') as f:
+                f.write(response.content)
+            logger.info(f"Successfully downloaded file to {output_path}")
+            return output_path
+        else:
+            logger.error(f"Failed to download file: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.exception(f"Error downloading file: {str(e)}")
+        return False
+
+def check_comfyui_readiness(node_hostname, max_retries=12, retry_delay=10):
+    """Check if ComfyUI is ready and wait until it's available
+    
+    Args:
+        node_hostname: Hostname of the node running ComfyUI
+        max_retries: Maximum number of retry attempts
+        retry_delay: Delay between retries in seconds
+        
+    Returns:
+        bool: True if ComfyUI is ready, False otherwise
+    """
+    comfyui_healthcheck_url = f"https://{node_hostname}/system_stats"
+    logger.info(f"Checking ComfyUI readiness at {comfyui_healthcheck_url}")
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"ComfyUI readiness check attempt {attempt}/{max_retries}")
+            
+            response = requests.get(
+                comfyui_healthcheck_url,
+                headers={"X-C3-API-KEY": api_key},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"ComfyUI is ready on attempt {attempt}")
+                return True
+            else:
+                logger.warning(f"ComfyUI not ready yet (status code: {response.status_code})")
+        except Exception as e:
+            logger.warning(f"ComfyUI readiness check failed on attempt {attempt}: {str(e)}")
+        
+        # If this isn't the last attempt, wait before retrying
+        if attempt < max_retries:
+            logger.info(f"Waiting {retry_delay} seconds before retrying ComfyUI readiness check...")
+            time.sleep(retry_delay)
+    
+    logger.error(f"ComfyUI not ready after {max_retries} attempts")
+    return False
+
 def process_portrait_job(job_id, job_data):
-    """Process a portrait video job"""
+    """Process a portrait video job using ComfyUI"""
     global current_job_id, current_job_data
     
     logger.info(f"Processing Portrait job: {job_id}")
@@ -698,18 +779,407 @@ def process_portrait_job(job_id, job_data):
         current_job_id = job_id
         current_job_data = job_data
         
-        # TODO: Connect to ComfyUI for video generation
-        # TODO: Download image and audio from URLs to output directory with job ID filename
-        # image_output_path = os.path.join(OUTPUT_DIR, f"{job_id}_image.jpg")
-        # audio_output_path = os.path.join(OUTPUT_DIR, f"{job_id}_audio.mp3")
-        # TODO: Run portrait generation workflow
-        # TODO: Save result to output directory with job ID filename
-        # video_output_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
+        # Download files from URLs with the correct naming convention
+        image_output_base = os.path.join(OUTPUT_DIR, f"{job_id}_portrait")
+        audio_output_base = os.path.join(OUTPUT_DIR, f"{job_id}_audio")
         
-        # For now, just simulate success
-        result_url = f"file://{OUTPUT_DIR}/{job_id}.mp4"
-        update_job_status(job_id, "success", result_url=result_url)
-        send_webhook_notification(job_id, job_data, "success", result_url=result_url)
+        # Download files with extension preservation
+        downloaded_image = download_file(image_url, image_output_base)
+        if not downloaded_image:
+            error_msg = "Failed to download image file"
+            update_job_status(job_id, "failed", error=error_msg)
+            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+            return
+        
+        downloaded_audio = download_file(audio_url, audio_output_base)
+        if not downloaded_audio:
+            error_msg = "Failed to download audio file"
+            update_job_status(job_id, "failed", error=error_msg)
+            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+            # Clean up downloaded image
+            if os.path.exists(downloaded_image):
+                os.unlink(downloaded_image)
+            return
+        
+        # Run portrait generation using ComfyUI
+        video_output_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
+        
+        # Get ComfyUI endpoint URLs from the GPU instance - direct to the root without /comfyui prefix
+        node_hostname = gpu_instance.get('node')
+        comfyui_base_url = f"https://{node_hostname}"
+        comfyui_prompt_url = f"{comfyui_base_url}/prompt"
+        comfyui_upload_url = f"{comfyui_base_url}/upload/image"
+        comfyui_upload_audio_url = f"{comfyui_base_url}/upload/audio"
+        comfyui_history_url = f"{comfyui_base_url}/history"
+        
+        # Wait for ComfyUI to be ready
+        logger.info("Waiting for ComfyUI container to be ready...")
+        if not check_comfyui_readiness(node_hostname):
+            error_msg = "ComfyUI container failed to become ready"
+            update_job_status(job_id, "failed", error=error_msg)
+            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+            # Clean up downloaded files
+            if os.path.exists(downloaded_image):
+                os.unlink(downloaded_image)
+            if os.path.exists(downloaded_audio):
+                os.unlink(downloaded_audio)
+            return
+        
+        # File names to use on ComfyUI server - preserve the extensions
+        server_image_name = os.path.basename(downloaded_image)
+        server_audio_name = os.path.basename(downloaded_audio)
+        
+        # Upload files to the ComfyUI server
+        logger.info(f"Uploading image to ComfyUI at {comfyui_upload_url}")
+        
+        try:
+            # Upload image file - determine MIME type based on extension
+            image_ext = os.path.splitext(downloaded_image)[1].lower()
+            image_mime = "image/jpeg"  # Default
+            if image_ext == ".png":
+                image_mime = "image/png"
+            elif image_ext == ".jpg" or image_ext == ".jpeg":
+                image_mime = "image/jpeg"
+            elif image_ext == ".webp":
+                image_mime = "image/webp"
+            
+            with open(downloaded_image, 'rb') as f:
+                files = {
+                    'image': (server_image_name, f, image_mime)
+                }
+                headers = {"X-C3-API-KEY": api_key}
+                
+                response = requests.post(
+                    comfyui_upload_url,
+                    files=files,
+                    headers=headers,
+                    timeout=60
+                )
+                
+                if response.status_code == 200:
+                    logger.info(f"Successfully uploaded image to ComfyUI")
+                else:
+                    error_msg = f"Failed to upload image to ComfyUI: {response.status_code} - {response.text}"
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
+            
+            # Upload audio file - determine MIME type based on extension
+            audio_ext = os.path.splitext(downloaded_audio)[1].lower()
+            audio_mime = "audio/mpeg"  # Default
+            if audio_ext == ".mp3":
+                audio_mime = "audio/mpeg"
+            elif audio_ext == ".wav":
+                audio_mime = "audio/wav"
+            elif audio_ext == ".ogg":
+                audio_mime = "audio/ogg"
+            
+            with open(downloaded_audio, 'rb') as f:
+                files = {
+                    'audio': (server_audio_name, f, audio_mime)
+                }
+                headers = {"X-C3-API-KEY": api_key}
+                
+                response = requests.post(
+                    comfyui_upload_audio_url,
+                    files=files,
+                    headers=headers,
+                    timeout=60
+                )
+                
+                if response.status_code == 200:
+                    logger.info(f"Successfully uploaded audio to ComfyUI")
+                else:
+                    error_msg = f"Failed to upload audio to ComfyUI: {response.status_code} - {response.text}"
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
+            
+            # Prepare ComfyUI workflow
+            comfyui_workflow = {
+                "13": {
+                    "inputs": {
+                        "frame_rate": [
+                            "31",
+                            1
+                        ],
+                        "loop_count": 0,
+                        "filename_prefix": f"Video_{job_id}",
+                        "format": "video/h264-mp4",
+                        "pix_fmt": "yuv420p",
+                        "crf": 19,
+                        "save_metadata": True,
+                        "trim_to_audio": True,
+                        "pingpong": False,
+                        "save_output": True,
+                        "images": [
+                            "31",
+                            0
+                        ],
+                        "audio": [
+                            "26",
+                            0
+                        ]
+                    },
+                    "class_type": "VHS_VideoCombine",
+                    "_meta": {
+                        "title": "Video Combine 🎥🅥🅗🅢"
+                    }
+                },
+                "18": {
+                    "inputs": {
+                        "image": server_image_name
+                    },
+                    "class_type": "LoadImage",
+                    "_meta": {
+                        "title": "Load a portrait Image (Face Closeup)"
+                    }
+                },
+                "21": {
+                    "inputs": {
+                        "images": [
+                            "46",
+                            0
+                        ]
+                    },
+                    "class_type": "PreviewImage",
+                    "_meta": {
+                        "title": "Preview Image after Resize"
+                    }
+                },
+                "26": {
+                    "inputs": {
+                        "audio": server_audio_name
+                    },
+                    "class_type": "LoadAudio",
+                    "_meta": {
+                        "title": "LoadAudio"
+                    }
+                },
+                "31": {
+                    "inputs": {
+                        "seed": 2054408119,
+                        "inference_steps": 25,
+                        "dynamic_scale": 1,
+                        "fps": 25,
+                        "model": [
+                            "34",
+                            0
+                        ],
+                        "data_dict": [
+                            "35",
+                            0
+                        ]
+                    },
+                    "class_type": "SONICSampler",
+                    "_meta": {
+                        "title": "SONICSampler"
+                    }
+                },
+                "32": {
+                    "inputs": {
+                        "ckpt_name": "svd_xt.safetensors"
+                    },
+                    "class_type": "ImageOnlyCheckpointLoader",
+                    "_meta": {
+                        "title": "Image Only Checkpoint Loader (img2vid model)"
+                    }
+                },
+                "33": {
+                    "inputs": {
+                        "min_resolution": 576,
+                        "duration": 4,
+                        "expand_ratio": 1,
+                        "clip_vision": [
+                            "32",
+                            1
+                        ],
+                        "vae": [
+                            "32",
+                            2
+                        ],
+                        "audio": [
+                            "26",
+                            0
+                        ],
+                        "image": [
+                            "46",
+                            0
+                        ],
+                        "weight_dtype": [
+                            "34",
+                            1
+                        ]
+                    },
+                    "class_type": "SONIC_PreData",
+                    "_meta": {
+                        "title": "SONIC_PreData"
+                    }
+                },
+                "34": {
+                    "inputs": {
+                        "sonic_unet": "unet.pth",
+                        "ip_audio_scale": 1,
+                        "use_interframe": True,
+                        "dtype": "fp16",
+                        "model": [
+                            "32",
+                            0
+                        ]
+                    },
+                    "class_type": "SONICTLoader",
+                    "_meta": {
+                        "title": "SONICTLoader"
+                    }
+                },
+                "35": {
+                    "inputs": {
+                        "anything": [
+                            "33",
+                            0
+                        ]
+                    },
+                    "class_type": "easy cleanGpuUsed",
+                    "_meta": {
+                        "title": "Clean VRAM Used"
+                    }
+                },
+                "46": {
+                    "inputs": {
+                        "mode": "resize",
+                        "supersample": "true",
+                        "resampling": "lanczos",
+                        "rescale_factor": 1,
+                        "resize_width": 500,
+                        "resize_height": 500,
+                        "image": [
+                            "18",
+                            0
+                        ]
+                    },
+                    "class_type": "Image Resize",
+                    "_meta": {
+                        "title": "Image Resize"
+                    }
+                }
+            }
+            
+            # Queue the prompt in ComfyUI
+            logger.info(f"Sending workflow to ComfyUI at {comfyui_prompt_url}")
+            
+            # Prepare the prompt data
+            prompt_data = {
+                "prompt": comfyui_workflow
+            }
+            
+            # Send the request to ComfyUI
+            response = requests.post(
+                comfyui_prompt_url,
+                json=prompt_data,
+                headers={"X-C3-API-KEY": api_key},
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                prompt_id = result.get("prompt_id")
+                logger.info(f"ComfyUI workflow queued with prompt ID: {prompt_id}")
+                
+                # Poll for workflow completion
+                max_wait_time = 300  # 5 minutes
+                poll_interval = 5     # 5 seconds
+                timeout = time.time() + max_wait_time
+                
+                completed = False
+                output_filename = None
+                
+                while time.time() < timeout and not completed:
+                    # Check workflow history
+                    logger.info(f"Checking workflow status for prompt ID: {prompt_id}")
+                    
+                    history_response = requests.get(
+                        comfyui_history_url,
+                        headers={"X-C3-API-KEY": api_key},
+                        timeout=30
+                    )
+                    
+                    if history_response.status_code == 200:
+                        history = history_response.json()
+                        
+                        # Check if our prompt is in history and completed
+                        if prompt_id in history:
+                            prompt_info = history[prompt_id]
+                            
+                            # Check if execution is complete
+                            if "outputs" in prompt_info and prompt_info.get("status", {}).get("completed", False):
+                                logger.info(f"Workflow completed for prompt ID: {prompt_id}")
+                                completed = True
+                                
+                                # Get the output filename
+                                # The output node is node 13 (VideoCombine) which produces a video file
+                                if "13" in prompt_info.get("outputs", {}):
+                                    video_output = prompt_info["outputs"]["13"]
+                                    if video_output and isinstance(video_output, list) and len(video_output) > 0:
+                                        output_filename = video_output[0].get("filename")
+                                        logger.info(f"Found output filename: {output_filename}")
+                            
+                            elif prompt_info.get("status", {}).get("error", False):
+                                error_msg = prompt_info.get("status", {}).get("error_message", "Unknown error in ComfyUI workflow")
+                                logger.error(f"Workflow failed: {error_msg}")
+                                raise Exception(f"ComfyUI workflow failed: {error_msg}")
+                    
+                    if not completed:
+                        logger.info(f"Workflow still in progress, checking again in {poll_interval} seconds...")
+                        time.sleep(poll_interval)
+                
+                if not completed:
+                    raise Exception(f"Timed out waiting for ComfyUI workflow to complete after {max_wait_time} seconds")
+                
+                if not output_filename:
+                    raise Exception("ComfyUI workflow completed but no output filename was found")
+                
+                # Download the output file
+                output_url = f"{comfyui_base_url}/output/{output_filename}"
+                logger.info(f"Downloading output video from {output_url}")
+                
+                response = requests.get(
+                    output_url,
+                    headers={"X-C3-API-KEY": api_key},
+                    timeout=120
+                )
+                
+                if response.status_code == 200:
+                    with open(video_output_path, 'wb') as f:
+                        f.write(response.content)
+                    logger.info(f"Successfully downloaded output video to {video_output_path}")
+                    
+                    # Save the result URL
+                    result_url = upload_to_storage(video_output_path)
+                    
+                    # Update job status and send notification
+                    update_job_status(job_id, "success", result_url=result_url)
+                    send_webhook_notification(job_id, job_data, "success", result_url=result_url)
+                else:
+                    error_msg = f"Failed to download output video: {response.status_code} - {response.text}"
+                    logger.error(error_msg)
+                    raise Exception(error_msg)
+            else:
+                error_msg = f"Failed to queue ComfyUI workflow: {response.status_code} - {response.text}"
+                logger.error(error_msg)
+                raise Exception(error_msg)
+                
+        except Exception as e:
+            error_msg = f"Error running ComfyUI workflow: {str(e)}"
+            logger.exception(error_msg)
+            update_job_status(job_id, "failed", error=error_msg)
+            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+        
+        # Clean up input files
+        if os.path.exists(downloaded_image):
+            os.unlink(downloaded_image)
+            logger.info(f"Cleaned up input image file: {downloaded_image}")
+        
+        if os.path.exists(downloaded_audio):
+            os.unlink(downloaded_audio)
+            logger.info(f"Cleaned up input audio file: {downloaded_audio}")
         
     except Exception as e:
         error_msg = f"Error processing Portrait job: {str(e)}"
