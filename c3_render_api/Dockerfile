@@ -19,4 +19,4 @@ ENV FLASK_ENV=development
 EXPOSE 5000
 
 # Run the server
-CMD ["python", "c3_render_api.py"] 
+CMD ["python", "c3_render_api.py"]
