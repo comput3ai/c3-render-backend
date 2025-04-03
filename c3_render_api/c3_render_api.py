@@ -363,6 +363,12 @@ def get_result(job_id: str):
         logger.exception(f"Error getting job result: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
 
+@app.route("/", methods=["GET"])
+def root():
+    """Root endpoint showing API is running"""
+    current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    return jsonify({"status": "C3 Render API is running", "timestamp": current_time})
+
 @app.errorhandler(404)
 def page_not_found(e):
     return jsonify({"error": "Endpoint not found"}), 404
