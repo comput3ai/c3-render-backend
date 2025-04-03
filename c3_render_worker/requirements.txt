@@ -2,4 +2,7 @@ redis
 requests
 python-dotenv
 minio
-gradio_client 
+gradio_client
+pillow
+mutagen
+python-magic
