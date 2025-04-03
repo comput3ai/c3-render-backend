@@ -7,9 +7,9 @@ services:
     ports:
       - "5000:5000"
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - PORT=5000
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - PORT=${PORT}
     restart: unless-stopped
     depends_on:
       redis:
@@ -19,22 +19,24 @@ services:
     networks:
       - c3render
       - traefik-net
-    env_file:
-      - c3_render_api/.env
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.render-api.rule=Host(`${RENDER_HOSTNAME:-render.comput3.ai}`)"
       - "traefik.http.routers.render-api.entrypoints=websecure"
       - "traefik.http.routers.render-api.tls=true"
-      - "traefik.http.services.render-api.loadbalancer.server.port=5000"
+      - "traefik.http.services.render-api.loadbalancer.server.port=${PORT:-5000}"
   worker:
     build:
       context: .
       dockerfile: c3_render_worker/Dockerfile
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      # Minio settings should be configured in c3_render_worker/.env
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - C3_API_KEY=${C3_API_KEY}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_SECURE=${MINIO_SECURE}
     restart: unless-stopped
     depends_on:
       redis:
@@ -44,8 +46,6 @@ services:
       - ./output:/app/output
     networks:
       - c3render
-    env_file:
-      - c3_render_worker/.env
     deploy:
       replicas: ${WORKER_REPLICAS:-1}
   redis:
