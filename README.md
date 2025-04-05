@@ -12,8 +12,13 @@ A simple distributed system for managing AI rendering tasks including text-to-sp
 ### Local Development
 
 1. Set up environment variables:
-   - For the API: Copy `c3_render_api/.env.sample` to `c3_render_api/.env`
+   - For the API: Copy `c3_render_api/.env.sample` to `c3_render_api/.env`. (Note: Authentication is typically bypassed for local development)
    - For the Worker: Copy `c3_render_worker/.env.sample` to `c3_render_worker/.env` and add your Comput3.ai API key and Minio configuration
+
+**Note on MinIO for Local Development (Same-Host Docker):**
+If you are running the MinIO server in a separate Docker container (or compose setup) on the same host machine as the worker, and they share a Docker network, you typically need to configure the worker's `.env` file as follows:
+- `MINIO_ENDPOINT=minio:9000` (using the service name and default MinIO port)
+- `MINIO_SECURE=false` (as the connection is internal over HTTP)
 
 ```bash
 # For API
@@ -30,7 +35,7 @@ docker-compose up -d
 ```
 
 This will start:
-- API service on port 5000
+- API service on port 5000 (accessible via `http://localhost:5000`)
 - Redis on port 6379
 - Worker service (not exposed to host)
 
@@ -45,75 +50,58 @@ docker-compose logs -f worker
 ```
 
 4. Access the services:
-- API: http://localhost:5000
+- API: `http://localhost:5000` (No authentication usually required for local setup)
 
 ### Manual Setup
 
-1. Install dependencies:
-```bash
-# For API
-cd c3_render_api
-pip install -r requirements.txt
+(Follow similar steps as local Docker setup, running services directly)
 
-# For Worker
-cd c3_render_worker
-pip install -r requirements.txt
-```
+1. Install dependencies for API and Worker.
+2. Set up environment variables (API `.env` and Worker `.env`).
+3. Start Redis (e.g., `docker-compose up -d redis`).
+4. Run the API server (`cd c3_render_api && python c3_render_api.py`).
+5. Run the worker (`cd c3_render_worker && python c3_render_worker.py`).
 
-2. Set up environment variables by copying the sample files:
-```bash
-# For API
-cp c3_render_api/.env.sample c3_render_api/.env
+## Production Deployment
 
-# For Worker
-cp c3_render_worker/.env.sample c3_render_worker/.env
-# Edit .env files as needed for your environment, including C3_API_KEY and Minio configuration
-```
-
-3. Start Redis service (using Docker Compose):
-```bash
-docker-compose up -d redis
-```
-
-4. Run the API server:
-```bash
-cd c3_render_api
-python c3_render_api.py
-```
-
-5. Run the worker (in a separate terminal):
-```bash
-cd c3_render_worker
-python c3_render_worker.py
-```
+- **URL:** The API is expected to be served over **HTTPS** (e.g., `https://your-render-api.example.com`).
+- **Authentication:** Requests to the production API **must** include an API key via one of the following headers:
+  - `X-C3-RENDER-KEY: your_api_key_here`
+  - `Authorization: Bearer your_api_key_here`
+  (The key value should be configured on the API server, typically via the `C3_RENDER_API_KEY` environment variable in its `.env` file).
+- **WSGI Server:** Use a production-grade WSGI server like `gunicorn` (as configured in the API Dockerfile).
 
 ## Architecture
 
 - **Single job queue**: All jobs go into a single Redis queue (`queue:jobs`) regardless of type
 - **GPU Instance Management**: Workers maintain GPU instances for 5 minutes of idle time before shutting down
-- **Robust GPU Monitoring**: A dedicated monitoring thread performs health checks every 10 seconds, with multiple retry attempts for failed checks and verification against the Comput3.ai API
+- **Robust GPU Monitoring**: A dedicated monitoring thread performs health checks, with multiple retry attempts and verification against the Comput3.ai API
 - **Webhook Notifications**: Workers send webhook notifications with 5 retry attempts at 5-second intervals
 - **Job Status Tracking**: All job status information is stored in Redis
-- **Storage**: Uses Minio S3-compatible storage for storing job results (configured via environment variables)
+- **Storage**: Uses Minio S3-compatible storage for storing job results (configured via environment variables). Access to results is provided via **presigned URLs** valid for 7 days.
 - **Modular Design**: Worker functionality is separated into task-specific modules (csm.py, comfyui.py)
 
 ## API Endpoints
+
+**Note:** All examples below assume a **production deployment**. For **local development**, use `http://localhost:5000` and omit the `X-C3-RENDER-KEY` header.
 
 ### POST /csm
 Generate speech using the CSM (Collaborative Speech Model) text-to-speech system with configurable voice options, including voice cloning.
 
 ```bash
-# Basic text-to-speech request
-curl -X POST http://localhost:5000/csm \
+# Basic text-to-speech request (Production)
+curl -X POST https://your-render-api.example.com/csm \
   -H "Content-Type: application/json" \
+  -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "monologue": "Hello, this is a test of the C3 Render API text to speech system using CSM.",
     "notify_url": "https://your-webhook-endpoint.com/callback"
   }'
 
-# Text-to-speech with voice customization
-curl -X POST http://localhost:5000/csm \
+# Text-to-speech with voice customization (Production)
+curl -X POST https://your-render-api.example.com/csm \
   -H "Content-Type: application/json" \
+  -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "monologue": "This example uses the conversational voice type A with custom temperature and other parameters.",
     "voice": "conversational_a",
@@ -144,8 +132,9 @@ curl -X POST http://localhost:5000/csm \
 #### Example with Voice Cloning
 
 ```bash
-curl -X POST http://localhost:5000/csm \
+curl -X POST https://your-render-api.example.com/csm \
   -H "Content-Type: application/json" \
+  -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "monologue": "This is a voice cloning test. The system will try to mimic the voice in the reference audio.",
     "voice": "clone",
@@ -164,14 +153,14 @@ curl -X POST http://localhost:5000/csm \
 }
 ```
 
-The worker will process the job and generate speech using the CSM service on Comput3 GPU instances. Upon completion, a webhook will be sent to the `notify_url` with the result URL.
+The worker will process the job and generate speech using the CSM service on Comput3 GPU instances. Upon completion, a webhook will be sent to the `notify_url` with the result (a presigned URL valid for 7 days).
 
 Webhook payload on success:
 ```json
 {
   "id": "c1e8f9a0-1b2c-4d3e-9f4g-5h6i7j8k9l0m",
   "status": "success",
-  "result_url": "https://storage-endpoint.com/results/audio.mp3"
+  "result_url": "https://minio-endpoint.com/results/audio.mp3?X-Amz-Algorithm=...&X-Amz-Expires=604800&..." // Example Presigned URL
 }
 ```
 
@@ -203,17 +192,19 @@ POST /api/v1/jobs/whisper
 
 #### cURL Example
 ```bash
-# Basic whisper request
-curl -X POST http://localhost:5000/api/v1/jobs/whisper \
+# Basic whisper request (Production)
+curl -X POST https://your-render-api.example.com/api/v1/jobs/whisper \
   -H "Content-Type: application/json" \
+  -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "audio_url": "https://example.com/path/to/audio.mp3",
     "notify_url": "https://your-webhook-endpoint.com/callback"
   }'
 
-# Whisper request with model specification
-curl -X POST http://localhost:5000/api/v1/jobs/whisper \
+# Whisper request with model specification (Production)
+curl -X POST https://your-render-api.example.com/api/v1/jobs/whisper \
   -H "Content-Type: application/json" \
+  -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "audio_url": "https://example.com/path/to/audio.mp3",
     "model": "large",
@@ -240,8 +231,9 @@ POST /portrait
 
 #### Example Curl Command
 ```bash
-curl -X POST http://localhost:5000/portrait \
+curl -X POST https://your-render-api.example.com/portrait \
   -H "Content-Type: application/json" \
+  -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "image_url": "https://example.com/path/to/portrait.jpg",
     "audio_url": "https://example.com/path/to/audio.mp3",
@@ -265,10 +257,11 @@ curl -X POST http://localhost:5000/portrait \
 | **audio_url** | string | Required | URL to the audio file that will be used to animate the portrait |
 | **notify_url** | string | Optional | Webhook URL to receive job status updates |
 
-#### cURL Example
+#### cURL Example (Production)
 ```bash
-curl -X POST http://localhost:5000/portrait \
+curl -X POST https://your-render-api.example.com/portrait \
   -H "Content-Type: application/json" \
+  -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "image_url": "https://storage.example.com/portrait.jpg",
     "audio_url": "https://storage.example.com/speech.mp3",
@@ -291,7 +284,8 @@ Portrait video generation uses ComfyUI with the SONIC model to create animated t
 1. The worker downloads the provided image and audio files to the output directory
 2. ComfyUI's SONIC model processes the files to generate a talking face video that matches the audio
 3. The resulting MP4 video is saved to the output directory
-4. A webhook notification is sent upon completion with the URL to the generated video
+4. The video file is uploaded to MinIO storage.
+5. A webhook notification is sent upon completion with a **presigned URL** (valid for 7 days) to the generated video.
 
 The implementation uses a specialized workflow with the following components:
 - ImageOnlyCheckpointLoader: Loads the SVD_XT model for image animation
@@ -315,10 +309,11 @@ POST /analyze
 }
 ```
 
-#### cURL Example
+#### cURL Example (Production)
 ```bash
-curl -X POST http://localhost:5000/analyze \
+curl -X POST https://your-render-api.example.com/analyze \
   -H "Content-Type: application/json" \
+  -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "image_url": "https://example.com/path/to/image.jpg",
     "notify_url": "https://your-webhook-endpoint.com/callback"
@@ -341,13 +336,15 @@ Check the status of a submitted job.
 GET /status/{id}
 ```
 
-#### cURL Example
+#### cURL Example (Production)
 ```bash
 # Replace JOB_ID with the actual job ID returned when submitting a job
-curl -X GET http://localhost:5000/status/JOB_ID
+curl -X GET https://your-render-api.example.com/status/JOB_ID \
+  -H "X-C3-RENDER-KEY: your_api_key_here"
 
 # Example with an actual UUID
-curl -X GET http://localhost:5000/status/550e8400-e29b-41d4-a716-446655440000
+curl -X GET https://your-render-api.example.com/status/550e8400-e29b-41d4-a716-446655440000 \
+  -H "X-C3-RENDER-KEY: your_api_key_here"
 ```
 
 #### Example Response
@@ -365,19 +362,21 @@ Retrieve the result of a completed job.
 GET /result/{id}
 ```
 
-#### cURL Example
+#### cURL Example (Production)
 ```bash
 # Replace JOB_ID with the actual job ID returned when submitting a job
-curl -X GET http://localhost:5000/result/JOB_ID
+curl -X GET https://your-render-api.example.com/result/JOB_ID \
+  -H "X-C3-RENDER-KEY: your_api_key_here"
 
 # Example with an actual UUID
-curl -X GET http://localhost:5000/result/550e8400-e29b-41d4-a716-446655440000
+curl -X GET https://your-render-api.example.com/result/550e8400-e29b-41d4-a716-446655440000 \
+  -H "X-C3-RENDER-KEY: your_api_key_here"
 ```
 
 #### Example Response for Media Jobs (CSM, Portrait)
 ```json
 {
-  "result_url": "https://storage.example.com/results/JOB_ID.mp4"
+  "result_url": "https://minio-endpoint.com/results/JOB_ID.mp4?X-Amz-Algorithm=...&X-Amz-Expires=604800&..." // Example Presigned URL
 }
 ```
 
@@ -397,7 +396,7 @@ For successful jobs:
 {
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "success",
-  "result_url": "https://example.com/results/output.mp4"  // for media jobs (csm, portrait)
+  "result_url": "https://minio-endpoint.com/results/output.mp4?X-Amz-Algorithm=...&X-Amz-Expires=604800&..."  // for media jobs (csm, portrait), PRESIGNED URL
 }
 ```
 
@@ -420,7 +419,7 @@ For failed jobs:
 }
 ```
 
-The webhook will only include fields that are relevant to the specific job type and status. Text-based jobs (whisper, analyze) will include a `text` field with the result, while media-based jobs (csm, portrait) will include a `result_url` field pointing to the generated media file.
+The webhook will only include fields that are relevant to the specific job type and status. Text-based jobs (whisper, analyze) will include a `text` field with the result, while media-based jobs (csm, portrait) will include a `result_url` field containing the **presigned URL** to the generated media file (valid for 7 days).
 
 ### Webhook Reliability
 
@@ -439,7 +438,7 @@ The worker component implements intelligent GPU instance management:
 - After initialization, the worker performs an initial health check to verify the instance is ready
 
 ### Health Monitoring
-- A dedicated background thread monitors GPU instance health every 10 seconds when idle
+- A dedicated background thread monitors GPU instance health
 - During job execution, health checks are performed every 15 seconds
 - Health checks include:
   - Multiple retry attempts (up to 3) for failed health checks
@@ -477,13 +476,14 @@ The application is split into two main components:
 
 ## Docker Setup
 
-The application is containerized using Docker, with services defined in `docker-compose.yml`.
+The application is containerized using Docker, with services defined in `docker-compose.yml` (for development) and potentially `docker-compose.production.yaml` (for production).
 
 ### Key Services:
 
 - **API**: The Flask API endpoint for client requests
 - **Worker**: Background worker that processes jobs
 - **Redis**: For job queueing and data storage
+- **MinIO** (Optional, may run separately): S3-compatible storage service.
 
 ### Output Directory
 
@@ -493,22 +493,22 @@ The project includes a shared volume mount for output files:
 ./output:/app/output
 ```
 
-This directory is used to store temporary files generated by the worker, such as audio files from the CSM text-to-speech service. Files saved in this directory persist even after container restarts, making it useful for debugging and local development.
+This directory is used by the worker to store *temporary* files during processing (e.g., downloaded inputs, intermediate files) and potentially the final output *before* uploading to MinIO. Files saved in this directory may persist depending on the Docker setup, making it useful for debugging and local development.
 
-#### File Naming Convention
+#### File Naming Convention (Local Output / Temporary)
 
-Files in the output directory are named using the job ID as follows:
+Files temporarily stored in the output directory might follow this convention:
 
 - Text-to-speech (CSM) output: `{job_id}.mp3`
 - Speech-to-text (Whisper) input: `{job_id}_input.mp3`
 - Speech-to-text (Whisper) output: `{job_id}.txt`
-- Portrait video generation image input: `{job_id}_portrait.jpg`
-- Portrait video generation audio input: `{job_id}_audio.mp3`
+- Portrait video generation image input: `{job_id}_portrait.jpg` (or original extension)
+- Portrait video generation audio input: `{job_id}_audio.mp3` (or original extension)
 - Portrait video generation output: `{job_id}.mp4`
-- Image analysis input: `{job_id}_input.jpg`
+- Image analysis input: `{job_id}_input.jpg` (or original extension)
 - Image analysis output: `{job_id}.txt`
 
-This naming convention ensures that files are easily traceable to their originating jobs and prevents file naming conflicts.
+Note: The final persistent storage is MinIO, accessed via presigned URLs.
 
 ## License
 

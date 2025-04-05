@@ -9,6 +9,11 @@ import threading
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from minio import Minio
+from minio.error import S3Error
+import io
+import magic  # For MIME type detection
+from urllib.parse import urlparse, urlunparse
 
 # Import directly from local files
 import csm
@@ -35,6 +40,82 @@ logger.info(f"Using output directory: {OUTPUT_DIR}")
 redis_host = os.getenv("REDIS_HOST", "localhost")
 redis_port = int(os.getenv("REDIS_PORT", "6379"))
 redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+
+# MinIO configuration
+# These variables are typically injected via the environment section
+# in docker-compose.production.yaml, which often substitutes values
+# from a .env file loaded by docker compose.
+# Common production values might look like:
+# MINIO_ENDPOINT=your_public_minio.com
+# MINIO_ACCESS_KEY=your_access_key
+# MINIO_SECRET_KEY=your_secret_key
+# MINIO_BUCKET=your_bucket_name
+# MINIO_SECURE=true
+# MINIO_PUBLIC_URL=https://your_public_minio.com/
+#
+# NOTE for same-host Docker Compose setups (where worker and minio run
+# on the same docker network but possibly different compose files):
+# Use the service name and default port: MINIO_ENDPOINT=minio:9000
+# Use HTTP: MINIO_SECURE=false
+minio_endpoint = os.getenv("MINIO_ENDPOINT")
+minio_access_key = os.getenv("MINIO_ACCESS_KEY")
+minio_secret_key = os.getenv("MINIO_SECRET_KEY")
+minio_secure = os.getenv("MINIO_SECURE", "false").lower() == "true"
+minio_bucket = os.getenv("MINIO_BUCKET", "c3-render-output")
+minio_public_url = os.getenv("MINIO_PUBLIC_URL") # Base public URL for constructing final URLs
+
+# Initialize MinIO clients
+internal_minio_client = None
+public_minio_client = None
+
+# 1. Initialize Internal Client (for uploads)
+if all([minio_endpoint, minio_access_key, minio_secret_key, minio_bucket]):
+    try:
+        logger.info(f"Attempting to initialize INTERNAL MinIO client for endpoint: {minio_endpoint} (secure={minio_secure})")
+        internal_minio_client = Minio(
+            minio_endpoint,
+            access_key=minio_access_key,
+            secret_key=minio_secret_key,
+            secure=minio_secure
+        )
+        # Check bucket existence using the internal client
+        found = internal_minio_client.bucket_exists(minio_bucket)
+        if not found:
+            logger.error(f"❌ Configured MinIO bucket '{minio_bucket}' does not exist! Disabling MinIO uploads.")
+            internal_minio_client = None # Disable internal client if bucket missing
+        else:
+            logger.info(f"Internal MinIO client initialized successfully. Bucket '{minio_bucket}' found.")
+
+    except S3Error as conn_err:
+        logger.error(f"❌ Error connecting INTERNAL MinIO client ({minio_endpoint}) or checking bucket: {conn_err}")
+        internal_minio_client = None
+    except Exception as e:
+        logger.error(f"❌ Unexpected error initializing INTERNAL MinIO client for {minio_endpoint}: {e}")
+        internal_minio_client = None
+else:
+     logger.warning("⚠️ MinIO configuration incomplete for internal client (endpoint, keys, or bucket missing). File uploads via MinIO will be disabled.")
+
+# 2. Initialize Public Client (for presigned URL generation) - only if internal client is ready and public URL is set
+if internal_minio_client and minio_public_url:
+    try:
+        parsed_public_endpoint = urlparse(minio_public_url)
+        public_endpoint_netloc = parsed_public_endpoint.netloc or parsed_public_endpoint.path
+        public_secure = parsed_public_endpoint.scheme == 'https'
+
+        logger.info(f"Attempting to initialize PUBLIC MinIO client for endpoint: {public_endpoint_netloc} (secure={public_secure})")
+        public_minio_client = Minio(
+            public_endpoint_netloc,
+            access_key=minio_access_key, # Use same credentials
+            secret_key=minio_secret_key,
+            secure=public_secure
+        )
+        # Optional: Could add a light check here like list_buckets(limit=1) if needed, but maybe not necessary
+        # as it's only used for URL generation. Let's assume credentials are valid if internal client worked.
+        logger.info("Public MinIO client initialized successfully for presigned URL generation.")
+
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize PUBLIC MinIO client for {minio_public_url}: {e}. Presigned URLs may use internal hostname.")
+        public_minio_client = None # Ensure it's None if init fails
 
 # Single job queue name
 JOB_QUEUE = "queue:jobs"
@@ -84,34 +165,46 @@ def get_running_workloads():
         return []
 
 def launch_workload(workload_type="media:fast"):
-    """Launch a new workload of the specified type"""
+    """Launch a new workload of the specified type with retries"""
     url = f"{comput3_base_url}/launch"
+    retry_delays = [5, 15, 30, 45, 60]  # Delays in seconds
 
-    # Always set expiration to current time + 3600 seconds (1 hour)
-    current_time = int(time.time())
-    expires = current_time + 3600
+    for attempt, delay in enumerate(retry_delays, 1):
+        logger.info(f"Attempt {attempt}/{len(retry_delays)} to launch workload type: {workload_type}")
 
-    # Create launch data
-    data = {
-        "type": workload_type,
-        "expires": expires
-    }
+        # Always set expiration to current time + 3600 seconds (1 hour)
+        current_time = int(time.time())
+        expires = current_time + 3600
 
-    try:
-        response = requests.post(url, headers=comput3_headers, json=data)
+        # Create launch data
+        data = {
+            "type": workload_type,
+            "expires": expires
+        }
 
-        if response.status_code == 200:
-            result = response.json()
-            result["type"] = workload_type  # Add type to result for easier tracking
-            result["expires"] = expires     # Add expiration for tracking
-            return result
-        else:
-            logger.error(f"❌ Error launching workload: {response.status_code}")
-            logger.error(response.text)
-            return None
-    except Exception as e:
-        logger.error(f"❌ Error connecting to Comput3.ai: {str(e)}")
-        return None
+        try:
+            response = requests.post(url, headers=comput3_headers, json=data)
+
+            if response.status_code == 200:
+                result = response.json()
+                result["type"] = workload_type  # Add type to result for easier tracking
+                result["expires"] = expires     # Add expiration for tracking
+                logger.info(f"Successfully launched workload on attempt {attempt}")
+                return result
+            else:
+                logger.error(f"❌ Attempt {attempt} failed - Error launching workload: {response.status_code}")
+                logger.error(response.text)
+
+        except Exception as e:
+            logger.error(f"❌ Attempt {attempt} failed - Error connecting to Comput3.ai: {str(e)}")
+
+        # If not the last attempt, wait before retrying
+        if attempt < len(retry_delays):
+            logger.info(f"Waiting {delay} seconds before next launch attempt...")
+            time.sleep(delay)
+
+    logger.error(f"❌ Failed to launch workload after {len(retry_delays)} attempts.")
+    return None
 
 def stop_workload(workload_id):
     """Stop a running workload by its ID"""
@@ -310,25 +403,71 @@ def shutdown_gpu_instance():
     gpu_instance = None
 
 def upload_to_storage(file_path):
-    """Save file to storage and return the URL"""
-    logger.info(f"Saving file to output directory: {file_path}")
-    
-    try:
-        # Just return the local file path for now
-        # In a real environment, this would be replaced with actual storage upload
-        # and returning a publicly accessible URL
-        
-        # For development, construct a placeholder URL
-        filename = os.path.basename(file_path)
-        result_url = f"file://{file_path}"
-        logger.info(f"File saved. URL: {result_url}")
-        
-        return result_url
-        
-    except Exception as e:
-        logger.exception(f"Unexpected error during file handling: {str(e)}")
-        # Return a fallback URL for now
+    """Upload file to MinIO storage using internal client and return public presigned URL"""
+    # Check if the internal client (needed for upload) is available
+    if not internal_minio_client:
+        logger.error("Internal MinIO client not available. Cannot upload file.")
         return f"file://{file_path}"
+
+    if not os.path.exists(file_path):
+        logger.error(f"❌ File not found for upload: {file_path}")
+        return None # Indicate upload failure clearly
+
+    filename = os.path.basename(file_path)
+    # Use a simple object name structure: output/<original_filename>
+    object_name = f"output/{filename}"
+
+    logger.info(f"Uploading {file_path} to MinIO bucket '{minio_bucket}' as '{object_name}' using INTERNAL client.")
+
+    try:
+        # Detect MIME type using python-magic
+        mime_type = magic.from_file(file_path, mime=True)
+        logger.info(f"Detected MIME type: {mime_type}")
+
+        # Get file size
+        file_size = os.path.getsize(file_path)
+
+        # *** Use internal client for the actual upload ***
+        internal_minio_client.fput_object(
+            minio_bucket,
+            object_name,
+            file_path,
+            content_type=mime_type,
+        )
+        logger.info(f"Successfully uploaded {filename} ({file_size} bytes) using internal client.")
+
+        # *** Generate presigned URL using the PUBLIC client if available ***
+        url_client = public_minio_client or internal_minio_client # Fallback to internal if public failed/not configured
+
+        if public_minio_client:
+            logger.info("Generating presigned URL using PUBLIC client.")
+        else:
+            logger.warning("Public MinIO client not available. Generating presigned URL using INTERNAL client (URL might not be publicly accessible).")
+
+        try:
+            presigned_url = url_client.presigned_get_object(
+                minio_bucket,
+                object_name,
+                expires=timedelta(days=7)
+            )
+            logger.info(f"Generated presigned URL (valid for 7 days): {presigned_url}")
+            return presigned_url
+        except Exception as url_err:
+            logger.error(f"❌ Failed to generate presigned URL for {object_name} using {'public' if public_minio_client else 'internal'} client: {url_err}")
+            # Fallback to minio path if URL generation fails completely
+            return f"minio://{minio_bucket}/{object_name}"
+
+    except S3Error as e:
+        logger.error(f"❌ MinIO S3 Error during upload using internal client: {e}")
+        return f"file://{file_path}" # Fallback to local path on S3 error
+    except FileNotFoundError:
+        # This check is technically redundant due to the check at the start,
+        # but kept for robustness in case of race conditions.
+        logger.error(f"❌ File disappeared before upload: {file_path}")
+        return None # Indicate upload failure clearly
+    except Exception as e:
+        logger.exception(f"❌ Unexpected error during MinIO upload/URL generation: {str(e)}")
+        return f"file://{file_path}" # Fallback on unexpected error
 
 def send_webhook_notification(job_id, job_data, status, **kwargs):
     """Send webhook notification if URL is provided with retry logic"""
