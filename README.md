@@ -73,13 +73,25 @@ docker-compose logs -f worker
 
 ## Architecture
 
-- **Single job queue**: All jobs go into a single Redis queue (`queue:jobs`) regardless of type
-- **GPU Instance Management**: Workers maintain GPU instances for 5 minutes of idle time before shutting down
+- **Smart job queue processing**: Workers prioritize reusing existing GPU instances to minimize costs and startup times
+- **GPU Instance Management**: Workers maintain GPU instances for configurable idle time (default 5 minutes) before shutting down
 - **Robust GPU Monitoring**: A dedicated monitoring thread performs health checks, with multiple retry attempts and verification against the Comput3.ai API
 - **Webhook Notifications**: Workers send webhook notifications with 5 retry attempts at 5-second intervals
 - **Job Status Tracking**: All job status information is stored in Redis
 - **Storage**: Uses Minio S3-compatible storage for storing job results (configured via environment variables). Access to results is provided via **presigned URLs** valid for 7 days.
 - **Modular Design**: Worker functionality is separated into task-specific modules (csm.py, comfyui.py)
+- **Automatic Image Processing**: Workers automatically process images to maintain aspect ratios and handle oversized images
+
+## Worker Configuration
+
+The worker component can be configured with the following environment variables:
+
+- **C3_API_KEY**: Your Comput3.ai API key (required)
+- **REDIS_HOST**: Redis server hostname (default: localhost)
+- **REDIS_PORT**: Redis server port (default: 6379)
+- **OUTPUT_DIR**: Directory for temporary output files (default: /app/output)
+- **GPU_IDLE_TIMEOUT**: Time in seconds to keep a GPU alive after its last job (default: 300)
+- **PRE_LAUNCH_TIMEOUT**: Wait time in seconds before launching a new GPU (default: 15)
 
 ## API Endpoints
 

@@ -5,6 +5,7 @@ import logging
 import json
 import requests
 from urllib.parse import urlparse
+from PIL import Image  # Import Pillow for image processing
 
 logger = logging.getLogger(__name__)
 
@@ -166,13 +167,62 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             logger.error(error_msg)
             return False
         
+        # Get image dimensions and calculate resize values for ComfyUI workflow
+        processed_image = downloaded_image  # By default, use the original image
+        try:
+            with Image.open(downloaded_image) as img:
+                orig_width, orig_height = img.size
+                logger.info(f"Original image dimensions: {orig_width}x{orig_height}")
+                
+                # Check if image exceeds ComfyUI's dimension limits (2048 px)
+                if orig_width > 2048 or orig_height > 2048:
+                    # Calculate scale to fit within 2048x2048
+                    scale = min(2048 / orig_width, 2048 / orig_height)
+                    new_width = int(orig_width * scale)
+                    new_height = int(orig_height * scale)
+                    
+                    logger.info(f"Image exceeds ComfyUI limits. Preprocessing to {new_width}x{new_height}")
+                    
+                    # Create preprocessed image filename
+                    img_basename = os.path.basename(downloaded_image)
+                    name, ext = os.path.splitext(img_basename)
+                    processed_image = os.path.join(output_dir, f"{name}_processed{ext}")
+                    
+                    # Resize and save
+                    resized_img = img.resize((new_width, new_height), Image.LANCZOS)
+                    resized_img.save(processed_image)
+                    logger.info(f"Saved preprocessed image to {processed_image}")
+                    
+                    # Update dimensions for future reference
+                    orig_width, orig_height = new_width, new_height
+                
+                # Calculate scaling factors for workflow node resizing
+                width_scale = 1280 / orig_width
+                height_scale = 720 / orig_height
+                
+                # Use the smaller scaling factor to fit within constraints
+                scale = min(width_scale, height_scale)
+                
+                # Calculate new dimensions for workflow node
+                new_width = int(orig_width * scale)
+                new_height = int(orig_height * scale)
+                
+                logger.info(f"ComfyUI workflow will resize to {new_width}x{new_height} (maintaining aspect ratio)")
+        except Exception as e:
+            logger.warning(f"Error processing image dimensions: {e}. Using default resize values.")
+            processed_image = downloaded_image
+            new_width = 500
+            new_height = 500
+        
         downloaded_audio = download_file(audio_url, audio_output_base)
         if not downloaded_audio:
             error_msg = "Failed to download audio file"
             logger.error(error_msg)
-            # Clean up downloaded image
+            # Clean up downloaded and processed images
             if os.path.exists(downloaded_image):
                 os.unlink(downloaded_image)
+            if processed_image != downloaded_image and os.path.exists(processed_image):
+                os.unlink(processed_image)
             return False
         
         # Get ComfyUI endpoint URLs from the GPU instance
@@ -211,6 +261,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 # Clean up downloaded files
                 if os.path.exists(downloaded_image):
                     os.unlink(downloaded_image)
+                if processed_image != downloaded_image and os.path.exists(processed_image):
+                    os.unlink(processed_image)
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
                 
@@ -223,10 +275,10 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
         # Upload files to ComfyUI
         logger.info("Uploading files to ComfyUI")
         
-        # Upload image - simply get the basename of the downloaded file
-        image_filename = os.path.basename(downloaded_image)
+        # Upload image - simply get the basename of the processed file
+        image_filename = os.path.basename(processed_image)
         
-        with open(downloaded_image, 'rb') as f:
+        with open(processed_image, 'rb') as f:
             files = {'image': (image_filename, f)}
             response = requests.post(
                 f"{comfyui_url}/upload/image",
@@ -242,6 +294,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 # Clean up downloaded files
                 if os.path.exists(downloaded_image):
                     os.unlink(downloaded_image)
+                if processed_image != downloaded_image and os.path.exists(processed_image):
+                    os.unlink(processed_image)
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
                 
@@ -269,6 +323,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 # Clean up downloaded files
                 if os.path.exists(downloaded_image):
                     os.unlink(downloaded_image)
+                if processed_image != downloaded_image and os.path.exists(processed_image):
+                    os.unlink(processed_image)
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
                 
@@ -452,8 +508,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                     "supersample": "true",
                     "resampling": "lanczos",
                     "rescale_factor": 1,
-                    "resize_width": 500,
-                    "resize_height": 500,
+                    "resize_width": new_width,
+                    "resize_height": new_height,
                     "image": [
                         "18",
                         0
@@ -504,6 +560,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                         # Clean up downloaded files
                         if os.path.exists(downloaded_image):
                             os.unlink(downloaded_image)
+                        if processed_image != downloaded_image and os.path.exists(processed_image):
+                            os.unlink(processed_image)
                         if os.path.exists(downloaded_audio):
                             os.unlink(downloaded_audio)
                         
@@ -517,6 +575,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 # Clean up downloaded files
                 if os.path.exists(downloaded_image):
                     os.unlink(downloaded_image)
+                if processed_image != downloaded_image and os.path.exists(processed_image):
+                    os.unlink(processed_image)
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
                 
@@ -576,6 +636,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                             # Clean up downloaded files
                             if os.path.exists(downloaded_image):
                                 os.unlink(downloaded_image)
+                            if processed_image != downloaded_image and os.path.exists(processed_image):
+                                os.unlink(processed_image)
                             if os.path.exists(downloaded_audio):
                                 os.unlink(downloaded_audio)
                             
@@ -660,6 +722,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             # Clean up downloaded files
             if os.path.exists(downloaded_image):
                 os.unlink(downloaded_image)
+            if processed_image != downloaded_image and os.path.exists(processed_image):
+                os.unlink(processed_image)
             if os.path.exists(downloaded_audio):
                 os.unlink(downloaded_audio)
             
@@ -673,6 +737,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             # Clean up downloaded files
             if os.path.exists(downloaded_image):
                 os.unlink(downloaded_image)
+            if processed_image != downloaded_image and os.path.exists(processed_image):
+                os.unlink(processed_image)
             if os.path.exists(downloaded_audio):
                 os.unlink(downloaded_audio)
             
@@ -708,6 +774,10 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                     os.unlink(downloaded_image)
                     logger.info(f"Cleaned up input image: {downloaded_image}")
                 
+                if processed_image != downloaded_image and os.path.exists(processed_image):
+                    os.unlink(processed_image)
+                    logger.info(f"Cleaned up processed image: {processed_image}")
+                
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
                     logger.info(f"Cleaned up input audio: {downloaded_audio}")
@@ -720,6 +790,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 # Clean up downloaded files
                 if os.path.exists(downloaded_image):
                     os.unlink(downloaded_image)
+                if processed_image != downloaded_image and os.path.exists(processed_image):
+                    os.unlink(processed_image)
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
                 
@@ -732,6 +804,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             # Clean up downloaded files
             if os.path.exists(downloaded_image):
                 os.unlink(downloaded_image)
+            if processed_image != downloaded_image and os.path.exists(processed_image):
+                os.unlink(processed_image)
             if os.path.exists(downloaded_audio):
                 os.unlink(downloaded_audio)
             

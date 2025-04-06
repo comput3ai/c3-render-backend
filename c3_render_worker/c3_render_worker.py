@@ -36,6 +36,11 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/app/output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 logger.info(f"Using output directory: {OUTPUT_DIR}")
 
+# Timeout configurations
+GPU_IDLE_TIMEOUT = int(os.getenv("GPU_IDLE_TIMEOUT", "300"))  # Default: 5 minutes (300 seconds)
+PRE_LAUNCH_TIMEOUT = int(os.getenv("PRE_LAUNCH_TIMEOUT", "15"))  # Default: 15 seconds
+logger.info(f"Using GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s, PRE_LAUNCH_TIMEOUT: {PRE_LAUNCH_TIMEOUT}s")
+
 # Redis configuration
 redis_host = os.getenv("REDIS_HOST", "localhost")
 redis_port = int(os.getenv("REDIS_PORT", "6379"))
@@ -290,7 +295,7 @@ def monitor_gpu():
     """Monitor GPU instance health and shut it down if idle for too long or unhealthy"""
     global gpu_instance, last_job_time, gpu_monitor_active, current_job_id, current_job_data
     
-    idle_threshold = timedelta(minutes=5)
+    idle_threshold = timedelta(seconds=GPU_IDLE_TIMEOUT)
     
     while gpu_monitor_active and gpu_instance is not None:
         # Check if the instance is healthy
@@ -731,6 +736,49 @@ def update_job_status(job_id, status, **kwargs):
     
     logger.info(f"Updated job {job_id} status to {status}")
 
+def safely_peek_job():
+    """Check if there's a job in the queue without removing it"""
+    try:
+        # Use lrange to peek at the first job in the queue
+        jobs = redis_client.lrange(JOB_QUEUE, 0, 0)
+        if jobs:
+            return jobs[0]  # Return the job ID without removing it
+        return None
+    except Exception as e:
+        logger.error(f"Error peeking at job queue: {str(e)}")
+        return None
+
+def safely_claim_job(job_id):
+    """Atomically claim a job from the queue if it matches the expected ID"""
+    try:
+        # Use a Lua script to atomically check and remove the job
+        script = """
+        local job_id = ARGV[1]
+        local queue_key = KEYS[1]
+        
+        -- Check if the first job in the queue matches our expected job_id
+        local first_job = redis.call('lindex', queue_key, 0)
+        if first_job == job_id then
+            -- Remove and return the job
+            return redis.call('lpop', queue_key)
+        else
+            -- Job is no longer first in queue or was taken by another worker
+            return nil
+        end
+        """
+        
+        result = redis_client.eval(script, 1, JOB_QUEUE, job_id)
+        if result == job_id:
+            logger.info(f"Successfully claimed job {job_id}")
+            return True
+        else:
+            logger.info(f"Failed to claim job {job_id} - it was likely taken by another worker")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error claiming job: {str(e)}")
+        return False
+
 def process_job(job_id):
     """Process a job based on its type"""
     logger.info(f"Processing job {job_id}")
@@ -779,12 +827,37 @@ def main():
     
     try:
         while True:
-            # Check the job queue for waiting jobs
-            result = redis_client.blpop([JOB_QUEUE], timeout=1)
+            # Peek at the job queue without removing anything
+            job_id = safely_peek_job()
             
-            if result:
-                _, job_id = result
-                process_job(job_id)
+            if job_id:
+                logger.info(f"Found job in queue: {job_id}")
+                
+                # Check if we already have a healthy GPU
+                if gpu_instance is not None and is_gpu_healthy():
+                    # We have a GPU, claim the job immediately
+                    if safely_claim_job(job_id):
+                        process_job(job_id)
+                else:
+                    # No GPU available, wait before launching a new one
+                    logger.info(f"No GPU available. Waiting {PRE_LAUNCH_TIMEOUT} seconds before launching...")
+                    time.sleep(PRE_LAUNCH_TIMEOUT)
+                    
+                    # Check if the job is still in the queue
+                    if job_id == safely_peek_job():
+                        logger.info(f"Job {job_id} still in queue after waiting. Launching GPU...")
+                        
+                        # Get or launch a GPU
+                        instance = get_gpu_instance()
+                        
+                        if instance:
+                            # Successfully got a GPU, claim the job
+                            if safely_claim_job(job_id):
+                                process_job(job_id)
+                        else:
+                            logger.warning(f"Failed to launch GPU. Job {job_id} remains in queue.")
+                    else:
+                        logger.info(f"Job {job_id} was claimed by another worker during wait period.")
             
             # Small delay to avoid hammering Redis if no jobs
             time.sleep(0.1)

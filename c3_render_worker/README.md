@@ -14,6 +14,8 @@ A worker service that processes rendering jobs queued in Redis. The worker manag
 - Sends webhook notifications on job completion
 - Monitors GPU instance health
 - Auto-scales GPU instances based on demand
+- Smart GPU allocation to minimize costs
+- Automatic image preprocessing for optimal results
 
 ## Components
 
@@ -40,6 +42,10 @@ Required environment variables:
 - `REDIS_PORT`: Redis server port (default: 6379)
 - `OUTPUT_DIR`: Directory for temporary output files (default: /app/output)
 
+Optional environment variables:
+- `GPU_IDLE_TIMEOUT`: Time in seconds to keep a GPU alive after its last job (default: 300)
+- `PRE_LAUNCH_TIMEOUT`: Wait time in seconds before launching a new GPU (default: 15)
+
 ### Running the Worker
 
 ```bash
@@ -59,17 +65,25 @@ docker run -d --name c3-render-worker --env-file .env c3-render-worker
 
 ## Job Processing Flow
 
-1. Worker pulls job from Redis queue
-2. Worker checks job type (csm, portrait, whisper, analyze)
-3. Worker obtains a GPU instance from Comput3.ai (or reuses existing instance)
-4. Job is processed on the GPU instance
+1. Worker peeks at the job queue without removing jobs
+2. If the worker has an active GPU, it claims the job immediately
+3. If no GPU is available, worker waits for `PRE_LAUNCH_TIMEOUT` seconds before launching one
+4. After waiting, if the job is still available, the worker launches a GPU and processes the job
 5. Results are saved to the output directory
 6. Webhook notification is sent if a callback URL was provided
 7. Job status is updated in Redis
 
 ## GPU Instance Management
 
-- GPU instances are kept alive for 5 minutes after the last job
+- GPU instances are kept alive for `GPU_IDLE_TIMEOUT` seconds after the last job (default: 5 minutes)
+- Workers with existing GPUs claim jobs immediately, prioritizing warm GPU instances
+- New GPU launches are delayed to allow workers with existing GPUs to claim jobs first
 - A monitoring thread checks instance health regularly
 - Unhealthy instances are shut down and replaced
-- During job execution, the worker checks instance health more frequently
+
+## Image Processing
+
+- Portrait images are automatically resized while maintaining aspect ratio
+- Maximum dimensions are constrained to 1280px width and 720px height
+- Large images (>2048px in either dimension) are preprocessed to prevent ComfyUI failures
+- All image processing is handled with PIL for optimum performance
