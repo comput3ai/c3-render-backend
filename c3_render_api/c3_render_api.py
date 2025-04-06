@@ -167,9 +167,20 @@ def validate_whisper_params(data: Dict[str, Any]) -> Tuple[bool, str]:
     
     # Validate model if provided
     if "model" in data:
-        valid_models = ["tiny", "base", "small", "medium", "large"]
+        valid_models = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
         if data["model"] not in valid_models:
             return False, f"Invalid model. Must be one of: {', '.join(valid_models)}"
+    
+    # Validate task if provided
+    if "task" in data:
+        valid_tasks = ["transcribe", "translate"]
+        if data["task"] not in valid_tasks:
+            return False, f"Invalid task. Must be one of: {', '.join(valid_tasks)}"
+    
+    # Language validation is minimal since we allow empty strings for auto-detection
+    # and many different language codes
+    if "language" in data and not isinstance(data["language"], str):
+        return False, "language must be a string"
     
     # Validate notify_url if present
     if "notify_url" in data and not validate_url(data["notify_url"]):
@@ -244,9 +255,15 @@ def speech_to_text():
         if not is_valid:
             return jsonify({"error": error_message}), 400
         
-        # Set default model if not provided
+        # Set default values if not provided
         if "model" not in data:
             data["model"] = "medium"
+            
+        if "task" not in data:
+            data["task"] = "transcribe"
+            
+        if "language" not in data:
+            data["language"] = ""  # Empty string for auto-detection
         
         # Create job after validation
         job_id = create_job("whisper", data)

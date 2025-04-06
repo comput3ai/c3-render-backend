@@ -40,10 +40,20 @@ Create a talking head video from a portrait image and audio file.
 ### Speech-to-Text (Whisper)
 
 ```
-POST /api/v1/jobs/whisper
+POST /whisper
 ```
 
 Transcribe speech from an audio file to text.
+
+#### Request Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **audio_url** | string | Required | URL to the audio file to transcribe |
+| **model** | string | "medium" | Whisper model to use. Options: "tiny", "base", "small", "medium", "large", "large-v2", "large-v3" |
+| **task** | string | "transcribe" | Task type, can be "transcribe" or "translate" |
+| **language** | string | "" | Language code (empty for auto-detection) |
+| **notify_url** | string | Optional | Webhook URL to receive job status updates |
 
 ### Image Analysis
 

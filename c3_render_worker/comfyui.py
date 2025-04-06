@@ -151,7 +151,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
         output_dir: Directory to save output files
 
     Returns:
-        Path to the output video file or False if failed
+        Path to the output video file or tuple (False, error_message) if failed
     """
     logger.info(f"Generating portrait video for job {job_id}")
 
@@ -165,7 +165,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
         if not downloaded_image:
             error_msg = "Failed to download image file"
             logger.error(error_msg)
-            return False
+            return False, error_msg
 
         # Get image dimensions and calculate resize values for ComfyUI workflow
         processed_image = downloaded_image  # By default, use the original image
@@ -223,7 +223,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 os.unlink(downloaded_image)
             if processed_image != downloaded_image and os.path.exists(processed_image):
                 os.unlink(processed_image)
-            return False
+            return False, error_msg
 
         # Get ComfyUI endpoint URLs from the GPU instance
         node_hostname = gpu_instance.get('node')
@@ -266,7 +266,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
 
-                return False
+                return False, error_msg
 
             # Wait before retrying
             logger.info(f"Waiting {retry_delay} seconds before retrying...")
@@ -299,7 +299,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
 
-                return False
+                return False, error_msg
 
             uploaded_image_name = response.json().get('name', image_filename)
             logger.info(f"Image uploaded successfully as {uploaded_image_name}")
@@ -328,7 +328,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
 
-                return False
+                return False, error_msg
 
             uploaded_audio_name = response.json().get('name', audio_filename)
             logger.info(f"Audio uploaded successfully as {uploaded_audio_name}")
@@ -343,14 +343,14 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 raw_duration = audio.info.length
                 # Round up to the next second (math.ceil equivalent)
                 rounded_duration = int(raw_duration) + (1 if raw_duration % 1 > 0 else 0)
-                # Add 1 second safety margin
-                audio_duration = rounded_duration + 1
-                logger.info(f"Audio duration: {raw_duration:.2f}s → {audio_duration}s (rounded up + safety margin)")
+                # Add 3 seconds safety margin to prevent audio cutting
+                audio_duration = rounded_duration + 3
+                logger.info(f"Audio duration: {raw_duration:.2f}s → {audio_duration}s (rounded up + 3s safety margin)")
             else:
-                audio_duration = 5  # Default fallback
+                audio_duration = 8  # Default fallback (increased from 5)
                 logger.warning(f"Could not determine audio duration, using default: {audio_duration}s")
         except Exception as e:
-            audio_duration = 5  # Default fallback on error
+            audio_duration = 8  # Default fallback on error (increased from 5)
             logger.warning(f"Error getting audio duration: {e}, using default: {audio_duration}s")
 
         # Prepare the workflow
@@ -554,7 +554,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
 
                     # If this is the last attempt, fail
                     if attempt == max_queue_retries:
-                        error_msg = f"Failed to queue workflow after {max_queue_retries} attempts"
+                        error_msg = f"Failed to queue workflow after {max_queue_retries} attempts: {response.status_code} - {response.text}"
                         logger.error(error_msg)
 
                         # Clean up downloaded files
@@ -565,12 +565,13 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                         if os.path.exists(downloaded_audio):
                             os.unlink(downloaded_audio)
 
-                        return False
+                        return False, error_msg
 
                     # Wait before retrying
                     time.sleep(10)
             except Exception as e:
-                logger.error(f"Error queueing workflow: {str(e)}")
+                error_msg = f"Error queueing workflow: {str(e)}"
+                logger.error(error_msg)
 
                 # Clean up downloaded files
                 if os.path.exists(downloaded_image):
@@ -580,7 +581,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
 
-                return False
+                return False, error_msg
 
         # Wait for workflow completion
         logger.info(f"Waiting for workflow completion (prompt ID: {prompt_id})")
@@ -620,7 +621,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                     if "status" in history_data:
                         status = history_data["status"]
                         if status.get("status_str") == "error":
-                            error_message = "Workflow execution failed"
+                            error_message = "ComfyUI workflow execution failed"
 
                             # Try to get detailed error information
                             for msg in status.get("messages", []):
@@ -629,7 +630,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                                     node_id = error_details.get("node_id", "unknown")
                                     node_type = error_details.get("node_type", "unknown")
                                     exception = error_details.get("exception_message", "Unknown error")
-                                    error_message = f"Error in node {node_id} ({node_type}): {exception}"
+                                    error_message = f"ComfyUI error in node {node_id} ({node_type}): {exception}"
 
                             logger.error(f"Workflow failed with error: {error_message}")
 
@@ -641,7 +642,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                             if os.path.exists(downloaded_audio):
                                 os.unlink(downloaded_audio)
 
-                            return False
+                            return False, error_message
 
                     # Check if execution is complete
                     if "outputs" in history_data:
@@ -716,7 +717,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
 
         # If we timed out without completing
         if not completed:
-            error_msg = f"Workflow processing timed out after {max_wait_time} seconds"
+            error_msg = f"ComfyUI workflow processing timed out after {max_wait_time} seconds"
             logger.error(error_msg)
 
             # Clean up downloaded files
@@ -727,11 +728,11 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             if os.path.exists(downloaded_audio):
                 os.unlink(downloaded_audio)
 
-            return False
+            return False, error_msg
 
         # If we completed but didn't get an output filename
         if not output_filename:
-            error_msg = "Workflow completed but no output file was found"
+            error_msg = "ComfyUI workflow completed but no output file was found"
             logger.error(error_msg)
 
             # Clean up downloaded files
@@ -742,7 +743,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             if os.path.exists(downloaded_audio):
                 os.unlink(downloaded_audio)
 
-            return False
+            return False, error_msg
 
         # Download the output file
         logger.info(f"Downloading output video: {output_filename}")
@@ -784,7 +785,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
 
                 return output_video_path
             else:
-                error_msg = f"Failed to download output video: {response.status_code}"
+                error_msg = f"Failed to download output video: {response.status_code} - {response.text}"
                 logger.error(error_msg)
 
                 # Clean up downloaded files
@@ -795,7 +796,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
 
-                return False
+                return False, error_msg
 
         except Exception as e:
             error_msg = f"Error downloading output video: {str(e)}"
@@ -809,7 +810,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             if os.path.exists(downloaded_audio):
                 os.unlink(downloaded_audio)
 
-            return False
+            return False, error_msg
 
     except Exception as e:
         error_msg = f"Error in portrait video generation: {str(e)}"
@@ -819,7 +820,10 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
         if 'downloaded_image' in locals() and downloaded_image and os.path.exists(downloaded_image):
             os.unlink(downloaded_image)
 
+        if 'processed_image' in locals() and processed_image != downloaded_image and processed_image and os.path.exists(processed_image):
+            os.unlink(processed_image)
+
         if 'downloaded_audio' in locals() and downloaded_audio and os.path.exists(downloaded_audio):
             os.unlink(downloaded_audio)
 
-        return False
+        return False, error_msg

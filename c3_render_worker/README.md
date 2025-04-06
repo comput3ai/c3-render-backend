@@ -9,7 +9,7 @@ A worker service that processes rendering jobs queued in Redis. The worker manag
 - Handles multiple job types:
   - CSM text-to-speech with voice options
   - ComfyUI portrait video generation
-  - Whisper speech-to-text (coming soon)
+  - Whisper speech-to-text
   - Image analysis (coming soon)
 - Sends webhook notifications on job completion
 - Monitors GPU instance health
@@ -22,6 +22,7 @@ A worker service that processes rendering jobs queued in Redis. The worker manag
 - **c3_render_worker.py**: Main worker file that handles the job queue and dispatches jobs
 - **csm.py**: Module for text-to-speech generation using CSM
 - **comfyui.py**: Module for portrait video generation using ComfyUI
+- **whisper.py**: Module for speech-to-text transcription using Whisper
 - **Dockerfile**: Container definition for the worker
 - **env.sample**: Example environment variables configuration
 - **requirements.txt**: Python dependencies

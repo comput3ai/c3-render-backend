@@ -185,12 +185,12 @@ Webhook payload on failure:
 }
 ```
 
-### POST /api/v1/jobs/whisper
+### POST /whisper
 
 Transcribe audio to text.
 
 ```
-POST /api/v1/jobs/whisper
+POST /whisper
 ```
 
 #### Request Body
@@ -198,14 +198,26 @@ POST /api/v1/jobs/whisper
 {
   "audio_url": "https://storage.example.com/recording.mp3",
   "model": "medium",  // Optional, defaults to "medium"
+  "task": "transcribe",  // Optional, defaults to "transcribe", can also be "translate"
+  "language": "",  // Optional, defaults to auto-detection
   "notify_url": "https://myapp.example.com/webhooks/job-complete"  // Optional
 }
 ```
 
+#### Request Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| **audio_url** | string | Required | URL to the audio file to transcribe |
+| **model** | string | "medium" | Whisper model to use. Options: "tiny", "base", "small", "medium", "large", "large-v2", "large-v3" |
+| **task** | string | "transcribe" | Task type, can be "transcribe" or "translate" |
+| **language** | string | "" | Language code (empty for auto-detection) |
+| **notify_url** | string | Optional | Webhook URL to receive job status updates |
+
 #### cURL Example
 ```bash
 # Basic whisper request (Production)
-curl -X POST https://your-render-api.example.com/api/v1/jobs/whisper \
+curl -X POST https://your-render-api.example.com/whisper \
   -H "Content-Type: application/json" \
   -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
@@ -214,14 +226,43 @@ curl -X POST https://your-render-api.example.com/api/v1/jobs/whisper \
   }'
 
 # Whisper request with model specification (Production)
-curl -X POST https://your-render-api.example.com/api/v1/jobs/whisper \
+curl -X POST https://your-render-api.example.com/whisper \
   -H "Content-Type: application/json" \
   -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "audio_url": "https://example.com/path/to/audio.mp3",
-    "model": "large",
+    "model": "large-v3",
+    "task": "translate",
     "notify_url": "https://your-webhook-endpoint.com/callback"
   }'
+```
+
+#### Example Response
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440003",
+  "status": "queued"
+}
+```
+
+Upon completion, a webhook will be sent to the `notify_url` with the transcription result:
+
+Webhook payload on success:
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440003",
+  "status": "success",
+  "text": "This is the transcribed text from the audio file."
+}
+```
+
+Webhook payload on failure:
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440003",
+  "status": "failed",
+  "error": "Error message describing the failure"
+}
 ```
 
 ### Portrait Video Generation
