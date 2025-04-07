@@ -5,7 +5,8 @@ import logging
 import json
 import requests
 import re
-from gradio_client import Client
+import subprocess
+from gradio_client import Client, handle_file
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,46 @@ def split_text_into_sentences(text):
     
     logger.info(f"Split text into {len(sentences)} sentences")
     return sentences
+
+def convert_to_mono(audio_path):
+    """
+    Convert audio file to mono format if it's in stereo.
+    Returns path to a mono version of the audio file.
+    """
+    try:
+        # Create new filename for mono version
+        filename, ext = os.path.splitext(audio_path)
+        mono_path = f"{filename}_mono{ext}"
+        
+        # Use ffmpeg to check if audio is already mono
+        probe_cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'a:0', 
+            '-show_entries', 'stream=channels', '-of', 'json', audio_path
+        ]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            try:
+                channels = json.loads(result.stdout)['streams'][0]['channels']
+                if channels == 1:
+                    logger.info(f"Audio file is already mono: {audio_path}")
+                    return audio_path
+            except (json.JSONDecodeError, KeyError, IndexError) as e:
+                logger.warning(f"Error parsing ffprobe output: {str(e)}. Will convert to be safe.")
+        
+        # Use ffmpeg directly to convert to mono
+        convert_cmd = ['ffmpeg', '-i', audio_path, '-ac', '1', '-y', mono_path]
+        result = subprocess.run(convert_cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            logger.info(f"Saved mono audio to: {mono_path}")
+            return mono_path
+        else:
+            logger.warning(f"Error converting to mono with ffmpeg: {result.stderr}")
+            return audio_path
+    except Exception as e:
+        logger.warning(f"Error converting audio to mono: {str(e)}. Using original audio.")
+        return audio_path
 
 def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
     """Generate speech from text using CSM with configurable voice options"""
@@ -102,16 +143,18 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
         raise last_error
     
     try:
-        # Split text into sentences for better speech quality
-        sentences = split_text_into_sentences(monologue_text)
-        
-        # Prepare the monologue text as a JSON array of sentences
-        monologue_json = json.dumps(sentences)
+        # Prepare the monologue text as a JSON array with single item
+        # This matches exactly how the working script formats text
+        monologue_json = json.dumps([monologue_text])
+        logger.info(f"Prepared monologue text as single-item JSON array")
         
         # Handle voice cloning if reference audio is provided
         reference_audio_file = None
+        mono_audio_file = None
+        audio_file = None  # For handle_file result
+        
         if voice == "clone" and reference_audio_url and reference_text:
-            # Download reference audio for voice cloning
+            logger.info("=== Using upload_voice workflow ===")
             logger.info(f"Downloading reference audio for voice cloning: {reference_audio_url}")
             
             try:
@@ -124,6 +167,16 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
                     with open(reference_audio_file, 'wb') as f:
                         f.write(response.content)
                     logger.info(f"Downloaded reference audio to {reference_audio_file}")
+                    
+                    # Convert to mono if in stereo format (important for voice cloning to work)
+                    mono_audio_file = convert_to_mono(reference_audio_file)
+                    logger.info(f"Using mono audio file for voice cloning: {mono_audio_file}")
+                    
+                    # Format reference_audio properly - exactly as in working script
+                    logger.info(f"Preparing reference audio with handle_file")
+                    audio_file = handle_file(mono_audio_file)
+                    
+                    logger.info(f"Reference text: '{reference_text}'")
                 else:
                     logger.error(f"Failed to download reference audio: {response.status_code}")
                     raise Exception(f"Failed to download reference audio: {response.status_code}")
@@ -134,37 +187,38 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
         # Log the CSM parameters
         logger.info(f"CSM parameters: voice={voice}, temperature={temperature}, topk={topk}, " +
                    f"max_audio_length={max_audio_length}, pause_duration={pause_duration}")
-        if voice == "clone":
-            logger.info(f"Voice cloning parameters: reference_audio_url={reference_audio_url}, " +
-                       f"reference_text={reference_text}")
         
-        # Generate speech using the monologue mode with specified parameters
-        logger.info(f"Calling CSM with {voice} and {len(sentences)} sentences...")
-        
-        # Parameters for prediction
-        predict_params = {
-            "monologue_json": monologue_json,
-            "temperature": temperature,
-            "topk": topk,
-            "max_audio_length": max_audio_length,
-            "pause_duration": pause_duration,
-            "api_name": "/generate_monologue_audio"
-        }
-        
-        # Configure voice parameters based on type
-        if voice == "clone" and reference_audio_file:
-            # Use custom voice with reference audio and text
-            predict_params["speaker_voice"] = "upload_voice"
-            predict_params["speaker_text"] = reference_text
-            predict_params["speaker_audio"] = reference_audio_file
+        # Generate audio based on voice type - exact match to working script structure
+        if csm_voice == "upload_voice" and audio_file and reference_text:
+            # Voice cloning call path - exactly matching working script
+            logger.info("Generating audio with cloned voice...")
+            
+            result = client.predict(
+                speaker_voice="upload_voice",
+                speaker_text=reference_text,
+                speaker_audio=audio_file,
+                monologue_json=monologue_json,
+                temperature=temperature,
+                topk=topk,
+                max_audio_length=max_audio_length,
+                pause_duration=pause_duration,
+                api_name="/generate_monologue_audio"
+            )
         else:
-            # Use built-in voice options (random or conversational)
-            predict_params["speaker_voice"] = csm_voice
-            predict_params["speaker_text"] = ""
-            predict_params["speaker_audio"] = None
-        
-        # Call the CSM service to generate audio
-        result = client.predict(**predict_params)
+            # Standard voice call path - exactly matching working script
+            logger.info(f"=== Using {csm_voice} workflow ===")
+            
+            result = client.predict(
+                speaker_voice=csm_voice,
+                speaker_text="",  # No reference text needed for built-in voices
+                speaker_audio=None,  # No reference audio needed for built-in voices
+                monologue_json=monologue_json,
+                temperature=temperature,
+                topk=topk,
+                max_audio_length=max_audio_length,
+                pause_duration=pause_duration,
+                api_name="/generate_monologue_audio"
+            )
         
         # Result is a file path to the generated audio
         logger.info(f"CSM successfully generated audio: {result}")
@@ -179,19 +233,27 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
         
         logger.info(f"Saved audio to {output_path}")
         
-        # Clean up reference audio file if it exists
+        # Clean up reference audio files if they exist
         if reference_audio_file and os.path.exists(reference_audio_file):
             os.unlink(reference_audio_file)
             logger.info(f"Cleaned up reference audio file {reference_audio_file}")
+        
+        if mono_audio_file and mono_audio_file != reference_audio_file and os.path.exists(mono_audio_file):
+            os.unlink(mono_audio_file)
+            logger.info(f"Cleaned up mono audio file {mono_audio_file}")
         
         return output_path
         
     except Exception as e:
         logger.exception(f"Error generating speech with CSM: {str(e)}")
         
-        # Clean up reference audio file if it exists
+        # Clean up reference audio files if they exist
         if 'reference_audio_file' in locals() and reference_audio_file and os.path.exists(reference_audio_file):
             os.unlink(reference_audio_file)
             logger.info(f"Cleaned up reference audio file {reference_audio_file}")
+            
+        if 'mono_audio_file' in locals() and mono_audio_file and mono_audio_file != reference_audio_file and os.path.exists(mono_audio_file):
+            os.unlink(mono_audio_file)
+            logger.info(f"Cleaned up mono audio file {mono_audio_file}")
             
         raise

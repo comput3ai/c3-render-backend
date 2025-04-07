@@ -7,6 +7,7 @@ import redis
 import sys
 import threading
 import requests
+import random
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from minio import Minio
@@ -39,8 +40,9 @@ logger.info(f"Using output directory: {OUTPUT_DIR}")
 
 # Timeout configurations
 GPU_IDLE_TIMEOUT = int(os.getenv("GPU_IDLE_TIMEOUT", "300"))  # Default: 5 minutes (300 seconds)
-PRE_LAUNCH_TIMEOUT = int(os.getenv("PRE_LAUNCH_TIMEOUT", "15"))  # Default: 15 seconds
-logger.info(f"Using GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s, PRE_LAUNCH_TIMEOUT: {PRE_LAUNCH_TIMEOUT}s")
+PRE_LAUNCH_TIMEOUT_MIN = int(os.getenv("PRE_LAUNCH_TIMEOUT", "15"))  # Default minimum: 15 seconds
+PRE_LAUNCH_TIMEOUT_MAX = int(os.getenv("PRE_LAUNCH_TIMEOUT_MAX", "30"))  # Default maximum: 30 seconds
+logger.info(f"Using GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s, PRE_LAUNCH_TIMEOUT range: {PRE_LAUNCH_TIMEOUT_MIN}-{PRE_LAUNCH_TIMEOUT_MAX}s")
 
 # Redis configuration
 redis_host = os.getenv("REDIS_HOST", "localhost")
@@ -874,8 +876,9 @@ def main():
                                 shutdown_gpu_instance()
                 else:
                     # No GPU available, wait before launching a new one
-                    logger.info(f"No GPU available. Waiting {PRE_LAUNCH_TIMEOUT} seconds before launching...")
-                    time.sleep(PRE_LAUNCH_TIMEOUT)
+                    random_delay = random.randint(PRE_LAUNCH_TIMEOUT_MIN, PRE_LAUNCH_TIMEOUT_MAX)
+                    logger.info(f"No GPU available. Waiting {random_delay} seconds before launching...")
+                    time.sleep(random_delay)
 
                     # Check if the job is still in the queue
                     if job_id == safely_peek_job():

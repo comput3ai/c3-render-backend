@@ -74,6 +74,7 @@ docker-compose logs -f worker
 ## Architecture
 
 - **Smart job queue processing**: Workers prioritize reusing existing GPU instances to minimize costs and startup times
+- **Randomized startup delays**: Workers use random delays (15-30 seconds by default) before launching GPUs to prevent simultaneous launches
 - **GPU Instance Management**: Workers maintain GPU instances for configurable idle time (default 5 minutes) before shutting down
 - **Robust GPU Monitoring**: A dedicated monitoring thread performs health checks, with multiple retry attempts and verification against the Comput3.ai API
 - **Webhook Notifications**: Workers send webhook notifications with 5 retry attempts at 5-second intervals
@@ -91,7 +92,8 @@ The worker component can be configured with the following environment variables:
 - **REDIS_PORT**: Redis server port (default: 6379)
 - **OUTPUT_DIR**: Directory for temporary output files (default: /app/output)
 - **GPU_IDLE_TIMEOUT**: Time in seconds to keep a GPU alive after its last job (default: 300)
-- **PRE_LAUNCH_TIMEOUT**: Wait time in seconds before launching a new GPU (default: 15)
+- **PRE_LAUNCH_TIMEOUT**: Minimum wait time in seconds before launching a new GPU (default: 15)
+- **PRE_LAUNCH_TIMEOUT_MAX**: Maximum wait time in seconds before launching a new GPU (default: 30)
 
 ## API Endpoints
 

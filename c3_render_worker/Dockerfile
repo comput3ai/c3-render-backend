@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y file && \
+    apt-get install -y file ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
