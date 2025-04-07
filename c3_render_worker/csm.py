@@ -42,7 +42,7 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
         "random": "random_voice",
         "conversational_a": "conversational_a",
         "conversational_b": "conversational_b",
-        "clone": "custom_voice"
+        "clone": "upload_voice"
     }
     
     # Convert API voice name to CSM internal name
@@ -154,7 +154,7 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
         # Configure voice parameters based on type
         if voice == "clone" and reference_audio_file:
             # Use custom voice with reference audio and text
-            predict_params["speaker_voice"] = "custom_voice"
+            predict_params["speaker_voice"] = "upload_voice"
             predict_params["speaker_text"] = reference_text
             predict_params["speaker_audio"] = reference_audio_file
         else:
