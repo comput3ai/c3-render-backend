@@ -384,6 +384,65 @@ def get_status(job_id: str):
         logger.exception(f"Error getting job status: {str(e)}\n{error_details}")
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
+@app.route("/job/<job_id>", methods=["POST"])
+def update_job_status(job_id: str):
+    """Update job status endpoint (for frontend to mark jobs as timed out or cancelled)"""
+    try:
+        # Validate job ID format
+        if not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', job_id, re.IGNORECASE):
+            logger.error(f"Invalid job ID format: {job_id}")
+            return jsonify({"error": "Invalid job ID format"}), 400
+
+        # Check if job exists
+        job_data = get_job_status(job_id)
+        if not job_data:
+            logger.warning(f"Job not found: {job_id}")
+            return jsonify({"error": "Job not found"}), 404
+
+        # Get request data
+        data = request.get_json()
+        if not data or "status" not in data:
+            logger.error(f"Missing status in request body for job {job_id}")
+            return jsonify({"error": "Missing status in request body"}), 400
+
+        # Validate status
+        new_status = data["status"]
+        valid_statuses = ["timed_out", "cancelled", "failed"]
+        if new_status not in valid_statuses:
+            logger.error(f"Invalid status '{new_status}' requested for job {job_id}")
+            return jsonify({"error": f"Invalid status. Must be one of: {', '.join(valid_statuses)}"}), 400
+
+        # Get error message if provided
+        error_message = data.get("error", f"Job marked as {new_status} by client")
+
+        # Update job status
+        update_data = {
+            "status": new_status,
+            "error": error_message,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+
+        redis_client.hset(f"job:{job_id}", mapping=update_data)
+        logger.info(f"Job {job_id} status manually updated to '{new_status}'")
+
+        # Remove from queue if still there
+        removed = redis_client.lrem(JOB_QUEUE, 0, job_id)
+        if removed > 0:
+            logger.info(f"Removed job {job_id} from processing queue")
+
+        # Optionally delete the job data if requested
+        if data.get("remove_data", False):
+            redis_client.delete(f"job:{job_id}")
+            logger.info(f"Job {job_id} data removed from Redis")
+            return jsonify({"message": f"Job {job_id} marked as {new_status} and data removed"}), 200
+
+        return jsonify({"message": f"Job {job_id} marked as {new_status}"}), 200
+
+    except Exception as e:
+        error_details = traceback.format_exc()
+        logger.exception(f"Error updating job status: {str(e)}\n{error_details}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
 @app.route("/result/<job_id>", methods=["GET"])
 def get_result(job_id: str):
     """Get job result endpoint"""

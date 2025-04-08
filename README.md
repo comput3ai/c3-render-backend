@@ -412,6 +412,42 @@ curl -X GET https://your-render-api.example.com/status/550e8400-e29b-41d4-a716-4
 }
 ```
 
+### Update Job Status
+
+Manually update the status of a job, particularly for marking jobs as timed out or cancelled by the frontend.
+
+```
+POST /job/{id}
+```
+
+#### Request Body
+```json
+{
+  "status": "timed_out",  // Required: "timed_out", "cancelled", or "failed"
+  "error": "Job timed out after 30 minutes",  // Optional: custom error message
+  "remove_data": false  // Optional: whether to remove the job data from Redis
+}
+```
+
+#### cURL Example (Production)
+```bash
+# Replace JOB_ID with the actual job ID to update
+curl -X POST https://your-render-api.example.com/job/JOB_ID \
+  -H "Content-Type: application/json" \
+  -H "X-C3-RENDER-KEY: your_api_key_here" \
+  -d '{
+    "status": "timed_out",
+    "error": "Job timed out after waiting too long"
+  }'
+```
+
+#### Example Response
+```json
+{
+  "message": "Job 550e8400-e29b-41d4-a716-446655440000 marked as timed_out"
+}
+```
+
 ### Job Result
 
 Retrieve the result of a completed job.

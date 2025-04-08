@@ -71,6 +71,22 @@ GET /status/{job_id}
 
 Get the current status of a submitted job.
 
+### Update Job Status
+
+```
+POST /job/{job_id}
+```
+
+Manually update a job's status, primarily used by frontends to mark jobs as timed out or cancelled.
+
+#### Request Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| **status** | string | Yes | New status to set. Must be one of: "timed_out", "cancelled", "failed" |
+| **error** | string | No | Custom error message to store with the job. Defaults to auto-generated message |
+| **remove_data** | boolean | No | If true, job data will be completely removed from Redis after status update |
+
 ### Job Result
 
 ```

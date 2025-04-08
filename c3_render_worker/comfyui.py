@@ -162,17 +162,21 @@ def extract_audio_from_video(video_path, output_dir):
         name, _ = os.path.splitext(filename)
         audio_path = os.path.join(output_dir, f"{name}_audio.mp3")
 
-        # Use FFmpeg to extract audio
+        # Use FFmpeg to extract audio - force MP3 output
         cmd = [
             'ffmpeg',
             '-i', video_path,
-            '-q:a', '0',       # Use best quality
-            '-map', 'a',       # Only extract audio
-            '-y',              # Overwrite output file
+            '-vn',              # Disable video
+            '-acodec', 'libmp3lame',  # Force MP3 codec
+            '-q:a', '2',        # High quality (0-highest, 9-lowest)
+            '-ac', '2',         # Stereo output
+            '-ar', '44100',     # 44.1kHz sample rate
+            '-y',               # Overwrite output file
             audio_path
         ]
 
         # Run FFmpeg command
+        logger.info(f"Running FFmpeg command: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode == 0:
@@ -277,21 +281,37 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             import magic
             mime = magic.Magic(mime=True)
             file_type = mime.from_file(downloaded_audio)
-
-            if file_type.startswith('video/'):
-                logger.info(f"Detected video file: {file_type}. Extracting audio...")
+            
+            # Check for any video mime type
+            is_video = file_type.startswith('video/')
+            
+            # Also check for problematic audio containers that might need conversion
+            problematic_audio = file_type in [
+                'audio/x-m4a', 
+                'audio/aac', 
+                'audio/webm', 
+                'audio/ogg',
+                'application/ogg'
+            ]
+            
+            if is_video or problematic_audio:
+                if is_video:
+                    logger.info(f"Detected video file: {file_type}. Extracting audio to MP3...")
+                else:
+                    logger.info(f"Detected audio format that needs conversion: {file_type}. Converting to MP3...")
+                    
                 extracted_audio = extract_audio_from_video(downloaded_audio, output_dir)
-
+                
                 if extracted_audio:
                     # Keep a reference to the original file for cleanup
                     original_audio = downloaded_audio
                     # Use the extracted audio file instead
                     downloaded_audio = extracted_audio
-                    logger.info(f"Using extracted audio: {downloaded_audio}")
+                    logger.info(f"Using converted audio: {downloaded_audio}")
                 else:
-                    error_msg = "Failed to extract audio from video file"
+                    error_msg = "Failed to extract/convert audio file"
                     logger.error(error_msg)
-
+                    
                     # Clean up downloaded files
                     if os.path.exists(downloaded_image):
                         os.unlink(downloaded_image)
@@ -299,28 +319,41 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                         os.unlink(processed_image)
                     if os.path.exists(downloaded_audio):
                         os.unlink(downloaded_audio)
-
+                    
                     return False, error_msg
             else:
-                logger.info(f"Downloaded file is not a video: {file_type}")
+                logger.info(f"Downloaded file is usable audio format: {file_type}")
                 original_audio = None
         except ImportError:
             # Fall back to checking file extension if python-magic is not available
             _, ext = os.path.splitext(downloaded_audio.lower())
-            if ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv']:
-                logger.info(f"File has video extension: {ext}. Extracting audio...")
+            video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv', '.m4v', '.3gp']
+            audio_extensions_to_convert = ['.m4a', '.aac', '.ogg', '.opus', '.wma', '.wav']
+            
+            if ext in video_extensions:
+                logger.info(f"File has video extension: {ext}. Extracting audio to MP3...")
                 extracted_audio = extract_audio_from_video(downloaded_audio, output_dir)
-
+                need_conversion = True
+            elif ext in audio_extensions_to_convert:
+                logger.info(f"File has audio extension that needs conversion: {ext}. Converting to MP3...")
+                extracted_audio = extract_audio_from_video(downloaded_audio, output_dir)
+                need_conversion = True
+            else:
+                logger.info(f"File has supported audio extension: {ext}")
+                need_conversion = False
+                original_audio = None
+                
+            if need_conversion:
                 if extracted_audio:
                     # Keep a reference to the original file for cleanup
                     original_audio = downloaded_audio
                     # Use the extracted audio file instead
                     downloaded_audio = extracted_audio
-                    logger.info(f"Using extracted audio: {downloaded_audio}")
+                    logger.info(f"Using converted audio: {downloaded_audio}")
                 else:
-                    error_msg = "Failed to extract audio from video file"
+                    error_msg = "Failed to extract/convert audio file"
                     logger.error(error_msg)
-
+                    
                     # Clean up downloaded files
                     if os.path.exists(downloaded_image):
                         os.unlink(downloaded_image)
@@ -328,11 +361,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                         os.unlink(processed_image)
                     if os.path.exists(downloaded_audio):
                         os.unlink(downloaded_audio)
-
+                    
                     return False, error_msg
-            else:
-                logger.info(f"File doesn't have a known video extension: {ext}")
-                original_audio = None
         except Exception as e:
             logger.warning(f"Error checking file type, proceeding with file as-is: {str(e)}")
             original_audio = None
