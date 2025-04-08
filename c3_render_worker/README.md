@@ -47,6 +47,8 @@ Optional environment variables:
 - `GPU_IDLE_TIMEOUT`: Time in seconds to keep a GPU alive after its last job (default: 300)
 - `PRE_LAUNCH_TIMEOUT`: Minimum wait time in seconds before launching a new GPU (default: 15)
 - `PRE_LAUNCH_TIMEOUT_MAX`: Maximum wait time in seconds before launching a new GPU (default: 30)
+- `MAX_RENDER_TIME`: Maximum time in seconds allowed for a render job before timing out (default: 1800)
+- `RENDER_POLLING_INTERVAL`: Interval in seconds to check job status during rendering (default: 5)
 
 ### Running the Worker
 

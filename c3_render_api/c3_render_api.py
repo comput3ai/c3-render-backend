@@ -4,6 +4,7 @@ import uuid
 import json
 import logging
 import re
+import traceback
 from datetime import datetime
 from flask import Flask, request, jsonify
 from redis import Redis
@@ -99,17 +100,32 @@ def validate_int(value: Any, min_val: int = None, max_val: int = None) -> bool:
 
 def validate_csm_params(data: Dict[str, Any]) -> Tuple[bool, str]:
     """Validate parameters for CSM text-to-speech"""
-    # For backward compatibility, if text is provided but monologue is not, use text as monologue
-    if "text" in data and "monologue" not in data:
-        data["monologue"] = data["text"]
+    # Check that at least one of text or monologue is provided
+    if not data or ("text" not in data and "monologue" not in data):
+        return False, "Missing required field: either text or monologue must be provided"
     
-    # Check for required field
-    if not data or "monologue" not in data:
-        return False, "Missing required field: monologue"
+    # Validate text if provided
+    if "text" in data:
+        if not isinstance(data["text"], str):
+            return False, "text must be a string"
+        if not data["text"].strip():
+            return False, "text cannot be empty"
+            
+    # Validate monologue if provided
+    if "monologue" in data:
+        if not isinstance(data["monologue"], list):
+            return False, "monologue must be an array of strings"
+        if not data["monologue"]:
+            return False, "monologue array cannot be empty"
+        for sentence in data["monologue"]:
+            if not isinstance(sentence, str):
+                return False, "all items in monologue array must be strings"
+            if not sentence.strip():
+                return False, "monologue array cannot contain empty strings"
     
-    # Validate monologue is not empty
-    if not data["monologue"].strip():
-        return False, "Monologue cannot be empty"
+    # If both text and monologue are provided, return an error
+    if "text" in data and "monologue" in data:
+        return False, "Cannot provide both text and monologue parameters. Use only one."
     
     # Validate voice option
     if "voice" in data:
@@ -234,6 +250,7 @@ def text_to_speech():
         # Validate input parameters
         is_valid, error_message = validate_csm_params(data)
         if not is_valid:
+            logger.error(f"CSM validation error: {error_message}")
             return jsonify({"error": error_message}), 400
         
         # Create job after validation
@@ -241,8 +258,9 @@ def text_to_speech():
         return jsonify({"id": job_id, "status": "queued"})
         
     except Exception as e:
-        logger.exception(f"Error processing CSM request: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+        error_details = traceback.format_exc()
+        logger.exception(f"Error processing CSM request: {str(e)}\n{error_details}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 @app.route("/whisper", methods=["POST"])
 def speech_to_text():
@@ -253,6 +271,7 @@ def speech_to_text():
         # Validate input parameters
         is_valid, error_message = validate_whisper_params(data)
         if not is_valid:
+            logger.error(f"Whisper validation error: {error_message}")
             return jsonify({"error": error_message}), 400
         
         # Set default values if not provided
@@ -270,39 +289,49 @@ def speech_to_text():
         return jsonify({"id": job_id, "status": "queued"})
         
     except Exception as e:
-        logger.exception(f"Error processing Whisper request: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+        error_details = traceback.format_exc()
+        logger.exception(f"Error processing Whisper request: {str(e)}\n{error_details}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 @app.route("/portrait", methods=["POST"])
 def portrait_endpoint():
     """Text-to-video portrait endpoint"""
-    # Get request data
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Missing request body"}), 400
-    
-    # Validate parameters
-    validation_errors = validate_portrait_params(data)
-    if validation_errors:
-        return jsonify({"errors": validation_errors}), 400
-    
-    # Generate a unique job ID
-    job_id = str(uuid.uuid4())
-    
-    # Store job in Redis
-    job_data = {
-        "id": job_id,
-        "type": "portrait",
-        "status": "queued",
-        "data": json.dumps(data),
-        "created_at": time.time()
-    }
-    
-    redis_client.hmset(f"job:{job_id}", job_data)
-    redis_client.rpush(JOB_QUEUE, job_id)
-    
-    # Return job ID
-    return jsonify({"id": job_id, "status": "queued"}), 200
+    try:
+        # Get request data
+        data = request.get_json()
+        if not data:
+            logger.error("Portrait request missing request body")
+            return jsonify({"error": "Missing request body"}), 400
+        
+        # Validate parameters
+        validation_errors = validate_portrait_params(data)
+        if validation_errors:
+            logger.error(f"Portrait validation errors: {json.dumps(validation_errors)}")
+            return jsonify({"errors": validation_errors}), 400
+        
+        # Generate a unique job ID
+        job_id = str(uuid.uuid4())
+        
+        # Store job in Redis
+        job_data = {
+            "id": job_id,
+            "type": "portrait",
+            "status": "queued",
+            "data": json.dumps(data),
+            "created_at": time.time()
+        }
+        
+        redis_client.hset(f"job:{job_id}", mapping=job_data)
+        redis_client.rpush(JOB_QUEUE, job_id)
+        
+        logger.info(f"Created portrait job {job_id}")
+        
+        # Return job ID
+        return jsonify({"id": job_id, "status": "queued"}), 200
+    except Exception as e:
+        error_details = traceback.format_exc()
+        logger.exception(f"Error processing Portrait request: {str(e)}\n{error_details}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 @app.route("/analyze", methods=["POST"])
 def image_analysis():
@@ -313,6 +342,7 @@ def image_analysis():
         # Validate input parameters
         is_valid, error_message = validate_analyze_params(data)
         if not is_valid:
+            logger.error(f"Analyze validation error: {error_message}")
             return jsonify({"error": error_message}), 400
         
         # Create job after validation
@@ -320,8 +350,9 @@ def image_analysis():
         return jsonify({"id": job_id, "status": "queued"})
         
     except Exception as e:
-        logger.exception(f"Error processing Analyze request: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+        error_details = traceback.format_exc()
+        logger.exception(f"Error processing Analyze request: {str(e)}\n{error_details}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 @app.route("/status/<job_id>", methods=["GET"])
 def get_status(job_id: str):
@@ -329,17 +360,29 @@ def get_status(job_id: str):
     try:
         # Validate job ID format
         if not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', job_id, re.IGNORECASE):
+            logger.error(f"Invalid job ID format: {job_id}")
             return jsonify({"error": "Invalid job ID format"}), 400
             
         job_data = get_job_status(job_id)
         if not job_data:
+            logger.warning(f"Job not found: {job_id}")
             return jsonify({"error": "Job not found"}), 404
         
-        return jsonify({"id": job_id, "status": job_data["status"]})
+        response = {"id": job_id, "status": job_data["status"]}
+        
+        # Include error message if job failed
+        if job_data["status"] == "failed" and "error" in job_data:
+            response["error"] = job_data["error"]
+            logger.info(f"Job {job_id} status request - failed with error: {job_data['error']}")
+        else:
+            logger.info(f"Job {job_id} status request - current status: {job_data['status']}")
+            
+        return jsonify(response)
         
     except Exception as e:
-        logger.exception(f"Error getting job status: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+        error_details = traceback.format_exc()
+        logger.exception(f"Error getting job status: {str(e)}\n{error_details}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 @app.route("/result/<job_id>", methods=["GET"])
 def get_result(job_id: str):
@@ -347,14 +390,20 @@ def get_result(job_id: str):
     try:
         # Validate job ID format
         if not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', job_id, re.IGNORECASE):
+            logger.error(f"Invalid job ID format: {job_id}")
             return jsonify({"error": "Invalid job ID format"}), 400
             
         job_data = get_job_status(job_id)
         if not job_data:
+            logger.warning(f"Job not found: {job_id}")
             return jsonify({"error": "Job not found"}), 404
         
-        if job_data["status"] != "success":
-            return jsonify({"error": "Job not completed", "status": job_data["status"]}), 400
+        if job_data["status"] != "success" and job_data["status"] != "failed":
+            logger.warning(f"Job {job_id} not completed yet, status: {job_data['status']}")
+            error_msg = "Job not completed"
+            if job_data["status"] == "failed" and "error" in job_data:
+                error_msg = job_data["error"]
+            return jsonify({"error": error_msg, "status": job_data["status"]}), 400
         
         result = {}
         
@@ -373,12 +422,16 @@ def get_result(job_id: str):
         # Include error message if it exists
         if "error" in job_data:
             result["error"] = job_data["error"]
+            logger.info(f"Job {job_id} result request - includes error: {job_data['error']}")
+        else:
+            logger.info(f"Job {job_id} result request - success")
         
         return jsonify(result)
         
     except Exception as e:
-        logger.exception(f"Error getting job result: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+        error_details = traceback.format_exc()
+        logger.exception(f"Error getting job result: {str(e)}\n{error_details}")
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 @app.route("/", methods=["GET"])
 def root():
@@ -388,15 +441,19 @@ def root():
 
 @app.errorhandler(404)
 def page_not_found(e):
+    logger.warning(f"404 error: {request.path}")
     return jsonify({"error": "Endpoint not found"}), 404
 
 @app.errorhandler(405)
 def method_not_allowed(e):
+    logger.warning(f"405 error: {request.method} {request.path}")
     return jsonify({"error": "Method not allowed"}), 405
 
 @app.errorhandler(500)
 def internal_server_error(e):
-    return jsonify({"error": "Internal server error"}), 500
+    error_details = traceback.format_exc()
+    logger.exception(f"500 error: {str(e)}\n{error_details}")
+    return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000"))) 

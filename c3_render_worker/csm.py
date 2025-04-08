@@ -8,6 +8,9 @@ import re
 import subprocess
 from gradio_client import Client, handle_file
 
+# Import from constants file
+from constants import MAX_RENDER_TIME, RENDER_POLLING_INTERVAL
+
 logger = logging.getLogger(__name__)
 
 def split_text_into_sentences(text):
@@ -97,7 +100,25 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
     # Voice cloning parameters
     reference_audio_url = job_params.get("reference_audio_url")
     reference_text = job_params.get("reference_text")
-    monologue_text = job_params.get("monologue", job_params.get("text", ""))
+    
+    # Handle different input formats for text/monologue
+    if "monologue" in job_params:
+        # If monologue is already an array, use it directly
+        if isinstance(job_params["monologue"], list):
+            monologue_array = job_params["monologue"]
+            logger.info(f"Using provided monologue array with {len(monologue_array)} sentences")
+        else:
+            # If monologue is a string, convert it to a single-item array
+            monologue_array = [job_params["monologue"]]
+            logger.warning("Monologue was provided as a string but should be an array. Converting to single-item array.")
+    elif "text" in job_params:
+        # If text is provided, convert it to an array with a single item
+        monologue_array = [job_params["text"]]
+        logger.info("Using text parameter as single-item monologue array")
+    else:
+        # Default to empty string if neither is provided
+        monologue_array = [""]
+        logger.warning("Neither monologue nor text provided. Using empty string.")
     
     # Get node hostname from GPU instance
     node_hostname = gpu_instance.get('node')
@@ -143,12 +164,11 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
         raise last_error
     
     try:
-        # Prepare the monologue text as a JSON array with single item
-        # This matches exactly how the working script formats text
-        monologue_json = json.dumps([monologue_text])
-        logger.info(f"Prepared monologue text as single-item JSON array")
+        # Prepare the monologue array as JSON - always as an array for consistency with original code
+        monologue_json = json.dumps(monologue_array)
+        logger.info(f"Prepared monologue JSON with {len(monologue_array)} sentences: {monologue_json[:100]}...")
         
-        # Handle voice cloning if reference audio is provided
+        # Handle voice cloning
         reference_audio_file = None
         mono_audio_file = None
         audio_file = None  # For handle_file result
@@ -188,38 +208,75 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
         logger.info(f"CSM parameters: voice={voice}, temperature={temperature}, topk={topk}, " +
                    f"max_audio_length={max_audio_length}, pause_duration={pause_duration}")
         
-        # Generate audio based on voice type - exact match to working script structure
-        if csm_voice == "upload_voice" and audio_file and reference_text:
-            # Voice cloning call path - exactly matching working script
-            logger.info("Generating audio with cloned voice...")
-            
-            result = client.predict(
-                speaker_voice="upload_voice",
-                speaker_text=reference_text,
-                speaker_audio=audio_file,
-                monologue_json=monologue_json,
-                temperature=temperature,
-                topk=topk,
-                max_audio_length=max_audio_length,
-                pause_duration=pause_duration,
-                api_name="/generate_monologue_audio"
-            )
-        else:
-            # Standard voice call path - exactly matching working script
-            logger.info(f"=== Using {csm_voice} workflow ===")
-            
-            result = client.predict(
-                speaker_voice=csm_voice,
-                speaker_text="",  # No reference text needed for built-in voices
-                speaker_audio=None,  # No reference audio needed for built-in voices
-                monologue_json=monologue_json,
-                temperature=temperature,
-                topk=topk,
-                max_audio_length=max_audio_length,
-                pause_duration=pause_duration,
-                api_name="/generate_monologue_audio"
-            )
+        # Set up prediction parameters
+        predict_params = {
+            "monologue_json": monologue_json,
+            "temperature": temperature,
+            "topk": topk,
+            "max_audio_length": max_audio_length,
+            "pause_duration": pause_duration,
+            "api_name": "/generate_monologue_audio"
+        }
         
+        # Add voice-specific parameters
+        if csm_voice == "upload_voice" and audio_file and reference_text:
+            # Voice cloning call path
+            logger.info("Generating audio with cloned voice...")
+            predict_params["speaker_voice"] = "upload_voice"
+            predict_params["speaker_text"] = reference_text
+            predict_params["speaker_audio"] = audio_file
+        else:
+            # Standard voice call path
+            logger.info(f"=== Using {csm_voice} workflow ===")
+            predict_params["speaker_voice"] = csm_voice
+            predict_params["speaker_text"] = ""  # No reference text needed for built-in voices
+            predict_params["speaker_audio"] = None  # No reference audio needed for built-in voices
+        
+        # Set up timeout tracking
+        start_time = time.time()
+        max_wait_time = MAX_RENDER_TIME
+        
+        # Use the client with a custom progress tracking function to handle timeouts
+        logger.info(f"Starting CSM generation with {max_wait_time}s timeout")
+        
+        result = None
+        
+        # Submit the prediction request and start tracking
+        job = client.submit(**predict_params)
+        
+        # Poll for completion with timeout
+        while True:
+            elapsed_time = time.time() - start_time
+            
+            if elapsed_time > max_wait_time:
+                logger.error(f"CSM generation timed out after {max_wait_time} seconds")
+                # Try to cancel the job if possible
+                try:
+                    job.cancel()
+                except:
+                    pass
+                
+                # Clean up reference audio files if they exist
+                if 'reference_audio_file' in locals() and reference_audio_file and os.path.exists(reference_audio_file):
+                    os.unlink(reference_audio_file)
+                    logger.info(f"Cleaned up reference audio file {reference_audio_file}")
+                    
+                if 'mono_audio_file' in locals() and mono_audio_file and mono_audio_file != reference_audio_file and os.path.exists(mono_audio_file):
+                    os.unlink(mono_audio_file)
+                    logger.info(f"Cleaned up mono audio file {mono_audio_file}")
+                
+                raise Exception(f"Text-to-speech generation timed out after {max_wait_time} seconds")
+                
+            # Check if job is done
+            if job.done():
+                logger.info("CSM generation completed")
+                result = job.result()
+                break
+                
+            # Log progress and wait before checking again
+            logger.info(f"CSM generation in progress (elapsed: {elapsed_time:.1f}s)... Checking again in {RENDER_POLLING_INTERVAL}s")
+            time.sleep(RENDER_POLLING_INTERVAL)
+            
         # Result is a file path to the generated audio
         logger.info(f"CSM successfully generated audio: {result}")
         

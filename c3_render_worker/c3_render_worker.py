@@ -16,6 +16,15 @@ import io
 import magic  # For MIME type detection
 from urllib.parse import urlparse, urlunparse
 
+# Import from constants file
+from constants import (
+    GPU_IDLE_TIMEOUT,
+    PRE_LAUNCH_TIMEOUT_MIN,
+    PRE_LAUNCH_TIMEOUT_MAX,
+    MAX_RENDER_TIME,
+    RENDER_POLLING_INTERVAL
+)
+
 # Import directly from local files
 import csm
 import comfyui
@@ -38,11 +47,9 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/app/output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 logger.info(f"Using output directory: {OUTPUT_DIR}")
 
-# Timeout configurations
-GPU_IDLE_TIMEOUT = int(os.getenv("GPU_IDLE_TIMEOUT", "300"))  # Default: 5 minutes (300 seconds)
-PRE_LAUNCH_TIMEOUT_MIN = int(os.getenv("PRE_LAUNCH_TIMEOUT", "15"))  # Default minimum: 15 seconds
-PRE_LAUNCH_TIMEOUT_MAX = int(os.getenv("PRE_LAUNCH_TIMEOUT_MAX", "30"))  # Default maximum: 30 seconds
+# Log the loaded constants
 logger.info(f"Using GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s, PRE_LAUNCH_TIMEOUT range: {PRE_LAUNCH_TIMEOUT_MIN}-{PRE_LAUNCH_TIMEOUT_MAX}s")
+logger.info(f"Using MAX_RENDER_TIME: {MAX_RENDER_TIME}s, RENDER_POLLING_INTERVAL: {RENDER_POLLING_INTERVAL}s")
 
 # Redis configuration
 redis_host = os.getenv("REDIS_HOST", "localhost")

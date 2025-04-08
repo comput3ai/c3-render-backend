@@ -7,6 +7,9 @@ import requests
 from urllib.parse import urlparse
 from PIL import Image  # Import Pillow for image processing
 
+# Import from constants file
+from constants import MAX_RENDER_TIME, RENDER_POLLING_INTERVAL
+
 logger = logging.getLogger(__name__)
 
 def download_file(url, output_path=None, preserve_extension=True):
@@ -586,8 +589,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
         # Wait for workflow completion
         logger.info(f"Waiting for workflow completion (prompt ID: {prompt_id})")
 
-        max_wait_time = 600  # 10 minutes
-        poll_interval = 15    # 15 seconds
+        max_wait_time = MAX_RENDER_TIME  # Use environment variable for max wait time
+        poll_interval = RENDER_POLLING_INTERVAL  # Use environment variable for polling interval
         start_time = time.time()
 
         # Initially wait a bit for the workflow to start
@@ -749,7 +752,6 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
         logger.info(f"Downloading output video: {output_filename}")
 
         # Construct URL parameters
-        import urllib.parse
         params = {"filename": output_filename}
         download_url = f"{comfyui_url}/view?{urllib.parse.urlencode(params)}"
 

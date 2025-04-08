@@ -6,6 +6,9 @@ import json
 import requests
 from gradio_client import Client, handle_file
 
+# Import from constants file
+from constants import MAX_RENDER_TIME, RENDER_POLLING_INTERVAL
+
 logger = logging.getLogger(__name__)
 
 def download_audio(audio_url, output_path):
@@ -100,19 +103,54 @@ def speech_to_text_with_whisper(text, job_id, gpu_instance, api_key, output_dir)
         logger.info(f"Calling Whisper API with model {model}...")
         
         # Parameters for prediction
-        result = client.predict(
-            audio_file=handle_file(audio_input_path),  # Format file for Gradio
-            model=model,
-            task=task,
-            language=language,
-            device="cuda",
-            compute_type="float16",
-            batch_size=16,
-            vad_method="pyannote",
-            word_timestamps=True,
-            segment_resolution="sentence",
-            api_name="/transcribe_audio"
-        )
+        predict_params = {
+            "audio_file": handle_file(audio_input_path),  # Format file for Gradio
+            "model": model,
+            "task": task,
+            "language": language,
+            "device": "cuda",
+            "compute_type": "float16",
+            "batch_size": 16,
+            "vad_method": "pyannote",
+            "word_timestamps": True,
+            "segment_resolution": "sentence",
+            "api_name": "/transcribe_audio"
+        }
+        
+        # Set up timeout tracking
+        start_time = time.time()
+        max_wait_time = MAX_RENDER_TIME
+        
+        # Use the client with a custom progress tracking function to handle timeouts
+        logger.info(f"Starting Whisper transcription with {max_wait_time}s timeout")
+        
+        result = None
+        
+        # Submit the prediction request and start tracking
+        job = client.submit(**predict_params)
+        
+        # Poll for completion with timeout
+        while True:
+            elapsed_time = time.time() - start_time
+            
+            if elapsed_time > max_wait_time:
+                logger.error(f"Whisper transcription timed out after {max_wait_time} seconds")
+                # Try to cancel the job if possible
+                try:
+                    job.cancel()
+                except:
+                    pass
+                raise Exception(f"Transcription timed out after {max_wait_time} seconds")
+                
+            # Check if job is done
+            if job.done():
+                logger.info("Whisper transcription completed")
+                result = job.result()
+                break
+                
+            # Log progress and wait before checking again
+            logger.info(f"Whisper transcription in progress (elapsed: {elapsed_time:.1f}s)... Checking again in {RENDER_POLLING_INTERVAL}s")
+            time.sleep(RENDER_POLLING_INTERVAL)
         
         # Unpack the result (transcript text and file paths)
         transcript, download_files = result
