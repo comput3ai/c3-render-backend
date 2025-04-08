@@ -4,8 +4,10 @@ import time
 import logging
 import json
 import requests
+import urllib.parse
 from urllib.parse import urlparse
 from PIL import Image  # Import Pillow for image processing
+import subprocess
 
 # Import from constants file
 from constants import MAX_RENDER_TIME, RENDER_POLLING_INTERVAL
@@ -142,6 +144,48 @@ def download_file(url, output_path=None, preserve_extension=True):
         logger.exception(f"Error downloading file: {str(e)}")
         return False
 
+def extract_audio_from_video(video_path, output_dir):
+    """Extract audio from video file using FFmpeg and save as MP3
+    
+    Args:
+        video_path: Path to the video file
+        output_dir: Directory to save the extracted audio
+        
+    Returns:
+        Path to the extracted audio file or None if extraction failed
+    """
+    logger.info(f"Extracting audio from video file: {video_path}")
+    
+    try:
+        # Generate output filename
+        filename = os.path.basename(video_path)
+        name, _ = os.path.splitext(filename)
+        audio_path = os.path.join(output_dir, f"{name}_audio.mp3")
+        
+        # Use FFmpeg to extract audio
+        cmd = [
+            'ffmpeg', 
+            '-i', video_path, 
+            '-q:a', '0',       # Use best quality  
+            '-map', 'a',       # Only extract audio
+            '-y',              # Overwrite output file
+            audio_path
+        ]
+        
+        # Run FFmpeg command
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            logger.info(f"Successfully extracted audio to: {audio_path}")
+            return audio_path
+        else:
+            logger.error(f"Failed to extract audio: {result.stderr}")
+            return None
+            
+    except Exception as e:
+        logger.exception(f"Error extracting audio from video: {str(e)}")
+        return None
+
 def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key, output_dir):
     """Process a portrait video job using ComfyUI
 
@@ -227,6 +271,71 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             if processed_image != downloaded_image and os.path.exists(processed_image):
                 os.unlink(processed_image)
             return False, error_msg
+            
+        # Check if the downloaded file is a video and extract audio if needed
+        try:
+            import magic
+            mime = magic.Magic(mime=True)
+            file_type = mime.from_file(downloaded_audio)
+            
+            if file_type.startswith('video/'):
+                logger.info(f"Detected video file: {file_type}. Extracting audio...")
+                extracted_audio = extract_audio_from_video(downloaded_audio, output_dir)
+                
+                if extracted_audio:
+                    # Keep a reference to the original file for cleanup
+                    original_audio = downloaded_audio
+                    # Use the extracted audio file instead
+                    downloaded_audio = extracted_audio
+                    logger.info(f"Using extracted audio: {downloaded_audio}")
+                else:
+                    error_msg = "Failed to extract audio from video file"
+                    logger.error(error_msg)
+                    
+                    # Clean up downloaded files
+                    if os.path.exists(downloaded_image):
+                        os.unlink(downloaded_image)
+                    if processed_image != downloaded_image and os.path.exists(processed_image):
+                        os.unlink(processed_image)
+                    if os.path.exists(downloaded_audio):
+                        os.unlink(downloaded_audio)
+                    
+                    return False, error_msg
+            else:
+                logger.info(f"Downloaded file is not a video: {file_type}")
+                original_audio = None
+        except ImportError:
+            # Fall back to checking file extension if python-magic is not available
+            _, ext = os.path.splitext(downloaded_audio.lower())
+            if ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv']:
+                logger.info(f"File has video extension: {ext}. Extracting audio...")
+                extracted_audio = extract_audio_from_video(downloaded_audio, output_dir)
+                
+                if extracted_audio:
+                    # Keep a reference to the original file for cleanup
+                    original_audio = downloaded_audio
+                    # Use the extracted audio file instead
+                    downloaded_audio = extracted_audio
+                    logger.info(f"Using extracted audio: {downloaded_audio}")
+                else:
+                    error_msg = "Failed to extract audio from video file"
+                    logger.error(error_msg)
+                    
+                    # Clean up downloaded files
+                    if os.path.exists(downloaded_image):
+                        os.unlink(downloaded_image)
+                    if processed_image != downloaded_image and os.path.exists(processed_image):
+                        os.unlink(processed_image)
+                    if os.path.exists(downloaded_audio):
+                        os.unlink(downloaded_audio)
+                    
+                    return False, error_msg
+            else:
+                logger.info(f"File doesn't have a known video extension: {ext}")
+                original_audio = None
+        except Exception as e:
+            logger.warning(f"Error checking file type, proceeding with file as-is: {str(e)}")
+            original_audio = None
 
         # Get ComfyUI endpoint URLs from the GPU instance
         node_hostname = gpu_instance.get('node')
@@ -753,7 +862,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
 
         # Construct URL parameters
         params = {"filename": output_filename}
-        download_url = f"{comfyui_url}/view?{urllib.parse.urlencode(params)}"
+        from urllib.parse import urlencode
+        download_url = f"{comfyui_url}/view?{urlencode(params)}"
 
         output_video_path = os.path.join(output_dir, f"{job_id}.mp4")
 
@@ -784,6 +894,11 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
                     logger.info(f"Cleaned up input audio: {downloaded_audio}")
+                    
+                # Clean up original video file if we extracted audio
+                if 'original_audio' in locals() and original_audio and os.path.exists(original_audio):
+                    os.unlink(original_audio)
+                    logger.info(f"Cleaned up original video file: {original_audio}")
 
                 return output_video_path
             else:
@@ -797,6 +912,9 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                     os.unlink(processed_image)
                 if os.path.exists(downloaded_audio):
                     os.unlink(downloaded_audio)
+                # Clean up original video file if we extracted audio
+                if 'original_audio' in locals() and original_audio and os.path.exists(original_audio):
+                    os.unlink(original_audio)
 
                 return False, error_msg
 
@@ -811,6 +929,9 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 os.unlink(processed_image)
             if os.path.exists(downloaded_audio):
                 os.unlink(downloaded_audio)
+            # Clean up original video file if we extracted audio
+            if 'original_audio' in locals() and original_audio and os.path.exists(original_audio):
+                os.unlink(original_audio)
 
             return False, error_msg
 
