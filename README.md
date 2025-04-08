@@ -184,7 +184,7 @@ Webhook payload on success:
 Webhook payload on failure:
 ```json
 {
-  "id": "c1e8f9a0-1b2c-4d3e-9f4g-5h6i7j8k9l0m", 
+  "id": "c1e8f9a0-1b2c-4d3e-9f4g-5h6i7j8k9l0m",
   "status": "failed",
   "error": "Error message describing the failure"
 }

@@ -48,7 +48,7 @@ The worker component has direct integration with the Comput3.ai API for GPU inst
 
 1. **Integrated Comput3.ai API functions**:
    - `launch_workload()` - For starting "media:fast" GPU instances
-   - `check_node_health()` - For verifying instance availability 
+   - `check_node_health()` - For verifying instance availability
    - `stop_workload()` - For releasing instances after job completion
 
 2. **Worker implementation pattern**:

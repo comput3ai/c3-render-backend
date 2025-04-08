@@ -63,4 +63,4 @@ networks:
     driver: bridge
 
 volumes:
-  redis_data: 
+  redis_data:

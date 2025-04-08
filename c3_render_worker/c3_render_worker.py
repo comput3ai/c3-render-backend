@@ -609,30 +609,30 @@ def process_csm_job(job_id, job_data, gpu_instance):
 def process_whisper_job(job_id, job_data, gpu_instance):
     """Process a speech-to-text job"""
     global current_job_id, current_job_data
-    
+
     logger.info(f"Processing Whisper job: {job_id}")
-    
+
     try:
         # Extract job parameters
         job_params = json.loads(job_data.get("data", "{}"))
         audio_url = job_params.get("audio_url")
         model = job_params.get("model", "medium")
-        
+
         logger.info(f"Job parameters: audio_url={audio_url}, model={model}")
-        
+
         # Set current job for monitoring
         current_job_id = job_id
         current_job_data = job_data
-        
+
         # Process with Whisper
         transcription = whisper.speech_to_text_with_whisper(job_data.get("data", "{}"), job_id, gpu_instance, api_key, OUTPUT_DIR)
-        
+
         # Update job status and send notification
         update_job_status(job_id, "success", result=transcription)
         send_webhook_notification(job_id, job_data, "success", text=transcription)
-        
+
         return True
-        
+
     except Exception as e:
         error_msg = f"Error processing Whisper job: {str(e)}"
         logger.exception(error_msg)
@@ -647,24 +647,24 @@ def process_whisper_job(job_id, job_data, gpu_instance):
 def process_portrait_job(job_id, job_data, gpu_instance):
     """Process a portrait video job using ComfyUI"""
     global current_job_id, current_job_data
-    
+
     logger.info(f"Processing Portrait job: {job_id}")
-    
+
     try:
         # Extract job parameters
         job_params = json.loads(job_data.get("data", "{}"))
         image_url = job_params.get("image_url")
         audio_url = job_params.get("audio_url")
-        
+
         logger.info(f"Job parameters: image_url={image_url}, audio_url={audio_url}")
-        
+
         # Set current job for monitoring
         current_job_id = job_id
         current_job_data = job_data
-        
+
         # Run portrait generation using ComfyUI
         result = comfyui.generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key, OUTPUT_DIR)
-        
+
         # Handle result based on return type
         if isinstance(result, tuple) and len(result) == 2 and result[0] is False:
             # This is an error with detailed message
@@ -679,7 +679,7 @@ def process_portrait_job(job_id, job_data, gpu_instance):
             video_output_path = result
             # Save the result URL
             result_url = upload_to_storage(video_output_path)
-            
+
             # Update job status and send notification
             update_job_status(job_id, "success", result_url=result_url)
             send_webhook_notification(job_id, job_data, "success", result_url=result_url)
@@ -690,7 +690,7 @@ def process_portrait_job(job_id, job_data, gpu_instance):
             update_job_status(job_id, "failed", error=error_msg)
             send_webhook_notification(job_id, job_data, "failed", error=error_msg)
             return False
-        
+
     except Exception as e:
         error_msg = f"Error processing Portrait job: {str(e)}"
         logger.exception(error_msg)
