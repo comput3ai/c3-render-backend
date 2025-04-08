@@ -94,6 +94,8 @@ The worker component can be configured with the following environment variables:
 - **GPU_IDLE_TIMEOUT**: Time in seconds to keep a GPU alive after its last job (default: 300)
 - **PRE_LAUNCH_TIMEOUT**: Minimum wait time in seconds before launching a new GPU (default: 15)
 - **PRE_LAUNCH_TIMEOUT_MAX**: Maximum wait time in seconds before launching a new GPU (default: 30)
+- **MAX_RENDER_TIME**: Maximum time in seconds allowed for a render job before timing out (default: 1800)
+- **RENDER_POLLING_INTERVAL**: Interval in seconds to check job status during rendering (default: 5)
 
 ## API Endpoints
 
@@ -103,21 +105,21 @@ The worker component can be configured with the following environment variables:
 Generate speech using the CSM (Collaborative Speech Model) text-to-speech system with configurable voice options, including voice cloning.
 
 ```bash
-# Basic text-to-speech request (Production)
+# Basic text-to-speech request with text parameter (Production)
 curl -X POST https://your-render-api.example.com/csm \
   -H "Content-Type: application/json" \
   -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
-    "monologue": "Hello, this is a test of the C3 Render API text to speech system using CSM.",
+    "text": "Hello, this is a test of the C3 Render API text to speech system using CSM.",
     "notify_url": "https://your-webhook-endpoint.com/callback"
   }'
 
-# Text-to-speech with voice customization (Production)
+# Text-to-speech with monologue parameter as array of sentences (Production)
 curl -X POST https://your-render-api.example.com/csm \
   -H "Content-Type: application/json" \
   -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
-    "monologue": "This example uses the conversational voice type A with custom temperature and other parameters.",
+    "monologue": ["This is the first sentence.", "This is the second sentence."],
     "voice": "conversational_a",
     "temperature": 0.7,
     "topk": 40,
@@ -131,7 +133,8 @@ curl -X POST https://your-render-api.example.com/csm \
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| **monologue** | string | Required | The text to convert to speech |
+| **text** | string | - | The text to convert to speech (use either text OR monologue) |
+| **monologue** | array of strings | - | Array of sentences to convert to speech (use either text OR monologue) |
 | **notify_url** | string | Optional | Webhook URL to receive job status updates |
 | **voice** | string | "random" | Voice type to use. Options: "random", "conversational_a", "conversational_b", or "clone" for voice cloning |
 | **reference_audio_url** | string | None | URL to reference audio file for voice cloning (required when voice="clone") |
@@ -141,7 +144,7 @@ curl -X POST https://your-render-api.example.com/csm \
 | **max_audio_length** | integer | 10000 | Maximum length of generated audio in milliseconds |
 | **pause_duration** | integer | 150 | Duration of pauses between sentences in milliseconds |
 
-> Note: For backward compatibility, the `text` field is still supported and will be treated the same as `monologue`.
+> Note: You must provide EITHER the `text` parameter (as a string) OR the `monologue` parameter (as an array of strings), but not both. The `monologue` format is preferred for better sentence pauses and phrasing.
 
 #### Example with Voice Cloning
 
@@ -150,7 +153,7 @@ curl -X POST https://your-render-api.example.com/csm \
   -H "Content-Type: application/json" \
   -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
-    "monologue": "This is a voice cloning test. The system will try to mimic the voice in the reference audio.",
+    "monologue": ["This is a voice cloning test.", "The system will try to mimic the voice in the reference audio."],
     "voice": "clone",
     "reference_audio_url": "https://example.com/reference-voice.mp3",
     "reference_text": "This is a sample of my voice for cloning purposes.",
@@ -567,4 +570,4 @@ Note: The final persistent storage is MinIO, accessed via presigned URLs.
 
 ## License
 
-MIT
+This software is proprietary to Nedos Consulting LLC and is licensed exclusively to Comput3 AI. All rights reserved. See the LICENSE file for details.
