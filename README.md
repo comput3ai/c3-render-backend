@@ -83,6 +83,32 @@ docker-compose logs -f worker
 - **Modular Design**: Worker functionality is separated into task-specific modules (csm.py, comfyui.py)
 - **Automatic Image Processing**: Workers automatically process images to maintain aspect ratios and handle oversized images
 
+## Job Timing and Execution Constraints
+
+All jobs support the following timing parameters to control execution constraints:
+
+- **max_time**: Maximum allowed runtime for a job in seconds (60-7200, default: 1200/20 minutes)
+  - If a job exceeds this runtime, it will be automatically terminated and marked as failed
+  - This measures actual processing time from when the worker starts the job
+
+- **complete_in**: Number of seconds from job creation when the job must complete (60-86400, default: 3600/1 hour)
+  - This is converted to an absolute `complete_by` timestamp in the worker
+  - If current time exceeds this timestamp, the job will be terminated and marked as failed
+  - Jobs already in the queue that have exceeded their `complete_by` time will be skipped and marked as expired
+
+These parameters provide flexible options for controlling job execution:
+- Use `max_time` to limit resource usage for individual jobs
+- Use `complete_in` to set hard deadlines for time-sensitive operations
+
+Example usage:
+```json
+{
+  "text": "This is an example with timing constraints.",
+  "max_time": 300,        // Must complete within 5 minutes of processing time
+  "complete_in": 1800     // Must complete within 30 minutes of being submitted
+}
+```
+
 ## Worker Configuration
 
 The worker component can be configured with the following environment variables:
@@ -111,7 +137,9 @@ curl -X POST https://your-render-api.example.com/csm \
   -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "text": "Hello, this is a test of the C3 Render API text to speech system using CSM.",
-    "notify_url": "https://your-webhook-endpoint.com/callback"
+    "notify_url": "https://your-webhook-endpoint.com/callback",
+    "max_time": 600,
+    "complete_in": 1800
   }'
 
 # Text-to-speech with monologue parameter as array of sentences (Production)
@@ -125,7 +153,9 @@ curl -X POST https://your-render-api.example.com/csm \
     "topk": 40,
     "max_audio_length": 8000,
     "pause_duration": 200,
-    "notify_url": "https://your-webhook-endpoint.com/callback"
+    "notify_url": "https://your-webhook-endpoint.com/callback",
+    "max_time": 900,
+    "complete_in": 3600
   }'
 ```
 
@@ -143,6 +173,8 @@ curl -X POST https://your-render-api.example.com/csm \
 | **topk** | integer | 50 | Number of highest probability tokens to consider at each generation step |
 | **max_audio_length** | integer | 10000 | Maximum length of generated audio in milliseconds |
 | **pause_duration** | integer | 150 | Duration of pauses between sentences in milliseconds |
+| **max_time** | integer | 1200 | Maximum allowed processing time in seconds (60-7200) |
+| **complete_in** | integer | 3600 | Job must complete within this many seconds of creation (60-86400) |
 
 > Note: You must provide EITHER the `text` parameter (as a string) OR the `monologue` parameter (as an array of strings), but not both. The `monologue` format is preferred for better sentence pauses and phrasing.
 
@@ -157,7 +189,9 @@ curl -X POST https://your-render-api.example.com/csm \
     "voice": "clone",
     "reference_audio_url": "https://example.com/reference-voice.mp3",
     "reference_text": "This is a sample of my voice for cloning purposes.",
-    "notify_url": "https://your-webhook-endpoint.com/callback"
+    "notify_url": "https://your-webhook-endpoint.com/callback",
+    "max_time": 1800,
+    "complete_in": 3600
   }'
 ```
 
@@ -205,7 +239,9 @@ POST /whisper
   "model": "medium",  // Optional, defaults to "medium"
   "task": "transcribe",  // Optional, defaults to "transcribe", can also be "translate"
   "language": "",  // Optional, defaults to auto-detection
-  "notify_url": "https://myapp.example.com/webhooks/job-complete"  // Optional
+  "notify_url": "https://myapp.example.com/webhooks/job-complete",  // Optional
+  "max_time": 600,  // Optional, default is 1200 seconds (20 minutes)
+  "complete_in": 1800  // Optional, default is 3600 seconds (1 hour)
 }
 ```
 
@@ -218,6 +254,8 @@ POST /whisper
 | **task** | string | "transcribe" | Task type, can be "transcribe" or "translate" |
 | **language** | string | "" | Language code (empty for auto-detection) |
 | **notify_url** | string | Optional | Webhook URL to receive job status updates |
+| **max_time** | integer | 1200 | Maximum allowed processing time in seconds (60-7200) |
+| **complete_in** | integer | 3600 | Job must complete within this many seconds of creation (60-86400) |
 
 #### cURL Example
 ```bash
@@ -227,7 +265,9 @@ curl -X POST https://your-render-api.example.com/whisper \
   -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "audio_url": "https://example.com/path/to/audio.mp3",
-    "notify_url": "https://your-webhook-endpoint.com/callback"
+    "notify_url": "https://your-webhook-endpoint.com/callback",
+    "max_time": 600,
+    "complete_in": 1800
   }'
 
 # Whisper request with model specification (Production)
@@ -238,7 +278,9 @@ curl -X POST https://your-render-api.example.com/whisper \
     "audio_url": "https://example.com/path/to/audio.mp3",
     "model": "large-v3",
     "task": "translate",
-    "notify_url": "https://your-webhook-endpoint.com/callback"
+    "notify_url": "https://your-webhook-endpoint.com/callback",
+    "max_time": 1800,
+    "complete_in": 3600
   }'
 ```
 
@@ -283,7 +325,9 @@ POST /portrait
 {
   "image_url": "https://storage.example.com/portrait.jpg",
   "audio_url": "https://storage.example.com/speech.mp3",
-  "notify_url": "https://myapp.example.com/webhooks/job-complete"  // Optional
+  "notify_url": "https://myapp.example.com/webhooks/job-complete",  // Optional
+  "max_time": 1800,  // Optional, default is 1200 seconds (20 minutes)
+  "complete_in": 3600  // Optional, default is 3600 seconds (1 hour)
 }
 ```
 
@@ -295,7 +339,9 @@ curl -X POST https://your-render-api.example.com/portrait \
   -d '{
     "image_url": "https://example.com/path/to/portrait.jpg",
     "audio_url": "https://example.com/path/to/audio.mp3",
-    "notify_url": "https://your-webhook-endpoint.com/callback"
+    "notify_url": "https://your-webhook-endpoint.com/callback",
+    "max_time": 1800,
+    "complete_in": 3600
   }'
 ```
 
@@ -314,6 +360,8 @@ curl -X POST https://your-render-api.example.com/portrait \
 | **image_url** | string | Required | URL to the portrait image (face) to animate |
 | **audio_url** | string | Required | URL to the audio file that will be used to animate the portrait |
 | **notify_url** | string | Optional | Webhook URL to receive job status updates |
+| **max_time** | integer | 1200 | Maximum allowed processing time in seconds (60-7200) |
+| **complete_in** | integer | 3600 | Job must complete within this many seconds of creation (60-86400) |
 
 #### cURL Example (Production)
 ```bash
@@ -323,7 +371,9 @@ curl -X POST https://your-render-api.example.com/portrait \
   -d '{
     "image_url": "https://storage.example.com/portrait.jpg",
     "audio_url": "https://storage.example.com/speech.mp3",
-    "notify_url": "https://myapp.example.com/webhooks/job-complete"
+    "notify_url": "https://myapp.example.com/webhooks/job-complete",
+    "max_time": 1800,
+    "complete_in": 7200
   }'
 ```
 
@@ -363,7 +413,9 @@ POST /analyze
 ```json
 {
   "image_url": "https://storage.example.com/image.jpg",
-  "notify_url": "https://myapp.example.com/webhooks/job-complete"  // Optional
+  "notify_url": "https://myapp.example.com/webhooks/job-complete",  // Optional
+  "max_time": 300,  // Optional, default is 1200 seconds (20 minutes)
+  "complete_in": 1800  // Optional, default is 3600 seconds (1 hour)
 }
 ```
 
@@ -374,7 +426,9 @@ curl -X POST https://your-render-api.example.com/analyze \
   -H "X-C3-RENDER-KEY: your_api_key_here" \
   -d '{
     "image_url": "https://example.com/path/to/image.jpg",
-    "notify_url": "https://your-webhook-endpoint.com/callback"
+    "notify_url": "https://your-webhook-endpoint.com/callback",
+    "max_time": 300,
+    "complete_in": 1800
   }'
 ```
 

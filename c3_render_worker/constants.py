@@ -6,7 +6,12 @@ import os
 
 # Timeout configurations
 GPU_IDLE_TIMEOUT = int(os.getenv("GPU_IDLE_TIMEOUT", "300"))  # Default: 5 minutes (300 seconds)
-PRE_LAUNCH_TIMEOUT_MIN = int(os.getenv("PRE_LAUNCH_TIMEOUT", "15"))  # Default minimum: 15 seconds
-PRE_LAUNCH_TIMEOUT_MAX = int(os.getenv("PRE_LAUNCH_TIMEOUT_MAX", "30"))  # Default maximum: 30 seconds
-MAX_RENDER_TIME = int(os.getenv("MAX_RENDER_TIME", "1800"))  # Default: 30 minutes (1800 seconds)
 RENDER_POLLING_INTERVAL = int(os.getenv("RENDER_POLLING_INTERVAL", "5"))  # Default: 5 seconds
+
+# Worker delay constants
+GPU_WORKER_DELAY = int(os.getenv("GPU_WORKER_DELAY", "1"))     # 1 second for workers with GPU already running
+NO_GPU_WORKER_DELAY = int(os.getenv("NO_GPU_WORKER_DELAY", "5"))  # 5 seconds for workers without GPU
+
+# Queue polling intervals
+LOCK_RETRY_INTERVAL = float(os.getenv("LOCK_RETRY_INTERVAL", "0.5"))  # Default: 0.5 seconds to retry when job is locked
+QUEUE_CHECK_INTERVAL = float(os.getenv("QUEUE_CHECK_INTERVAL", "0.5"))  # Default: 0.5 seconds between queue checks when idle

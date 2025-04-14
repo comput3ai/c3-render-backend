@@ -10,7 +10,10 @@ from PIL import Image  # Import Pillow for image processing
 import subprocess
 
 # Import from constants file
-from constants import MAX_RENDER_TIME, RENDER_POLLING_INTERVAL
+from constants import RENDER_POLLING_INTERVAL
+
+# Import job control from worker
+# from c3_render_worker import job_cancel_flag
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +193,7 @@ def extract_audio_from_video(video_path, output_dir):
         logger.exception(f"Error extracting audio from video: {str(e)}")
         return None
 
-def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key, output_dir):
+def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key, output_dir, cancel_callback=None):
     """Process a portrait video job using ComfyUI
 
     Args:
@@ -200,6 +203,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
         gpu_instance: GPU instance information
         api_key: API key for authentication
         output_dir: Directory to save output files
+        cancel_callback: Optional function that returns True if job should be cancelled
 
     Returns:
         Path to the output video file or tuple (False, error_message) if failed
@@ -281,27 +285,27 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             import magic
             mime = magic.Magic(mime=True)
             file_type = mime.from_file(downloaded_audio)
-            
+
             # Check for any video mime type
             is_video = file_type.startswith('video/')
-            
+
             # Also check for problematic audio containers that might need conversion
             problematic_audio = file_type in [
-                'audio/x-m4a', 
-                'audio/aac', 
-                'audio/webm', 
+                'audio/x-m4a',
+                'audio/aac',
+                'audio/webm',
                 'audio/ogg',
                 'application/ogg'
             ]
-            
+
             if is_video or problematic_audio:
                 if is_video:
                     logger.info(f"Detected video file: {file_type}. Extracting audio to MP3...")
                 else:
                     logger.info(f"Detected audio format that needs conversion: {file_type}. Converting to MP3...")
-                    
+
                 extracted_audio = extract_audio_from_video(downloaded_audio, output_dir)
-                
+
                 if extracted_audio:
                     # Keep a reference to the original file for cleanup
                     original_audio = downloaded_audio
@@ -311,7 +315,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 else:
                     error_msg = "Failed to extract/convert audio file"
                     logger.error(error_msg)
-                    
+
                     # Clean up downloaded files
                     if os.path.exists(downloaded_image):
                         os.unlink(downloaded_image)
@@ -319,7 +323,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                         os.unlink(processed_image)
                     if os.path.exists(downloaded_audio):
                         os.unlink(downloaded_audio)
-                    
+
                     return False, error_msg
             else:
                 logger.info(f"Downloaded file is usable audio format: {file_type}")
@@ -329,7 +333,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             _, ext = os.path.splitext(downloaded_audio.lower())
             video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv', '.m4v', '.3gp']
             audio_extensions_to_convert = ['.m4a', '.aac', '.ogg', '.opus', '.wma', '.wav']
-            
+
             if ext in video_extensions:
                 logger.info(f"File has video extension: {ext}. Extracting audio to MP3...")
                 extracted_audio = extract_audio_from_video(downloaded_audio, output_dir)
@@ -342,7 +346,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 logger.info(f"File has supported audio extension: {ext}")
                 need_conversion = False
                 original_audio = None
-                
+
             if need_conversion:
                 if extracted_audio:
                     # Keep a reference to the original file for cleanup
@@ -353,7 +357,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                 else:
                     error_msg = "Failed to extract/convert audio file"
                     logger.error(error_msg)
-                    
+
                     # Clean up downloaded files
                     if os.path.exists(downloaded_image):
                         os.unlink(downloaded_image)
@@ -361,7 +365,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                         os.unlink(processed_image)
                     if os.path.exists(downloaded_audio):
                         os.unlink(downloaded_audio)
-                    
+
                     return False, error_msg
         except Exception as e:
             logger.warning(f"Error checking file type, proceeding with file as-is: {str(e)}")
@@ -728,7 +732,6 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
         # Wait for workflow completion
         logger.info(f"Waiting for workflow completion (prompt ID: {prompt_id})")
 
-        max_wait_time = MAX_RENDER_TIME  # Use environment variable for max wait time
         poll_interval = RENDER_POLLING_INTERVAL  # Use environment variable for polling interval
         start_time = time.time()
 
@@ -738,7 +741,63 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
         completed = False
         output_filename = None
 
-        while time.time() - start_time < max_wait_time:
+        while True:
+            # Check if job has been cancelled by the monitor thread
+            if cancel_callback and cancel_callback():
+                logger.warning("Job cancellation detected - terminating workflow")
+                # Try to cancel the job if possible
+                try:
+                    cancel_url = f"{comfyui_url}/cancel"
+                    cancel_data = {"prompt_id": prompt_id}
+                    requests.post(cancel_url, headers={"X-C3-API-KEY": api_key}, json=cancel_data, timeout=10)
+                    logger.info(f"Sent cancellation request for prompt ID: {prompt_id}")
+                except Exception as e:
+                    logger.warning(f"Error sending cancellation request: {str(e)}")
+
+                # Get the specific error message from Redis if available
+                try:
+                    from redis import Redis
+                    redis_host = os.getenv("REDIS_HOST", "localhost")
+                    redis_port = int(os.getenv("REDIS_PORT", "6379"))
+                    redis_client = Redis(host=redis_host, port=redis_port, decode_responses=True)
+
+                    # Extract job_id from the job_id param or from output path
+                    job_id_match = job_id
+                    job_data = redis_client.hgetall(f"job:{job_id_match}")
+
+                    # Check for existing result_url
+                    result_url = job_data.get("result_url")
+
+                    if job_data and "error" in job_data:
+                        error_msg = job_data["error"]
+                        logger.info(f"Using specific error reason from Redis: {error_msg}")
+                    else:
+                        error_msg = "Job was cancelled by system"
+                except Exception as e:
+                    logger.warning(f"Error retrieving specific error message: {e}")
+                    error_msg = "Job was cancelled by system"
+                    result_url = None
+
+                # Clean up downloaded files
+                if os.path.exists(downloaded_image):
+                    os.unlink(downloaded_image)
+                if processed_image != downloaded_image and os.path.exists(processed_image):
+                    os.unlink(processed_image)
+                if os.path.exists(downloaded_audio):
+                    os.unlink(downloaded_audio)
+
+                # Let the caller know if we have a partial result
+                if 'result_url' in locals() and result_url:
+                    logger.info(f"Including partial result_url in cancel response: {result_url}")
+                    # Store the tuple with the error message and the result URL
+                    error_data = {
+                        "error": error_msg,
+                        "result_url": result_url
+                    }
+                    return False, error_data
+                else:
+                    return False, error_msg
+
             elapsed_time = time.time() - start_time
             logger.info(f"Checking workflow status (elapsed: {elapsed_time:.1f}s)...")
 
@@ -856,21 +915,6 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             # Wait before checking again
             logger.info(f"Still in progress... Checking again in {poll_interval} seconds")
             time.sleep(poll_interval)
-
-        # If we timed out without completing
-        if not completed:
-            error_msg = f"ComfyUI workflow processing timed out after {max_wait_time} seconds"
-            logger.error(error_msg)
-
-            # Clean up downloaded files
-            if os.path.exists(downloaded_image):
-                os.unlink(downloaded_image)
-            if processed_image != downloaded_image and os.path.exists(processed_image):
-                os.unlink(processed_image)
-            if os.path.exists(downloaded_audio):
-                os.unlink(downloaded_audio)
-
-            return False, error_msg
 
         # If we completed but didn't get an output filename
         if not output_filename:

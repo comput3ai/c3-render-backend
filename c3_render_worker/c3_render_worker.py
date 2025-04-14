@@ -8,6 +8,8 @@ import sys
 import threading
 import requests
 import random
+import socket
+import uuid
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from minio import Minio
@@ -19,11 +21,15 @@ from urllib.parse import urlparse, urlunparse
 # Import from constants file
 from constants import (
     GPU_IDLE_TIMEOUT,
-    PRE_LAUNCH_TIMEOUT_MIN,
-    PRE_LAUNCH_TIMEOUT_MAX,
-    MAX_RENDER_TIME,
-    RENDER_POLLING_INTERVAL
+    RENDER_POLLING_INTERVAL,
+    GPU_WORKER_DELAY,
+    NO_GPU_WORKER_DELAY,
+    LOCK_RETRY_INTERVAL,
+    QUEUE_CHECK_INTERVAL
 )
+
+# Generate a unique worker ID (hostname is sufficient with lock expiration)
+WORKER_ID = socket.gethostname()
 
 # Import directly from local files
 import csm
@@ -48,8 +54,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 logger.info(f"Using output directory: {OUTPUT_DIR}")
 
 # Log the loaded constants
-logger.info(f"Using GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s, PRE_LAUNCH_TIMEOUT range: {PRE_LAUNCH_TIMEOUT_MIN}-{PRE_LAUNCH_TIMEOUT_MAX}s")
-logger.info(f"Using MAX_RENDER_TIME: {MAX_RENDER_TIME}s, RENDER_POLLING_INTERVAL: {RENDER_POLLING_INTERVAL}s")
+logger.info(f"Using GPU_IDLE_TIMEOUT: {GPU_IDLE_TIMEOUT}s, RENDER_POLLING_INTERVAL: {RENDER_POLLING_INTERVAL}s")
 
 # Redis configuration
 redis_host = os.getenv("REDIS_HOST", "localhost")
@@ -155,12 +160,17 @@ comput3_headers = {
 gpu_instance = None
 last_job_time = datetime.now()
 gpu_launch_time = None  # Track when the GPU was launched
-gpu_monitor_thread = None
-gpu_monitor_active = False
+
+# Monitor thread
+monitor_thread = None
+monitor_active = False
 
 # Current job tracking
 current_job_id = None
 current_job_data = None
+job_start_time = None
+job_thread = None
+job_cancel_flag = False  # Flag to signal job cancellation
 
 def get_running_workloads():
     """Get all currently running workloads"""
@@ -298,72 +308,196 @@ def is_gpu_healthy():
 
     return True
 
-def start_gpu_monitor():
-    """Start a thread to monitor GPU instance health and idle time"""
-    global gpu_monitor_thread, gpu_monitor_active
+def start_monitor():
+    """Start a unified monitor thread for GPU health and job timeouts"""
+    global monitor_thread, monitor_active
 
-    if gpu_monitor_thread is not None and gpu_monitor_thread.is_alive():
+    if monitor_thread is not None and monitor_thread.is_alive():
         return
 
-    gpu_monitor_active = True
-    gpu_monitor_thread = threading.Thread(target=monitor_gpu, daemon=True)
-    gpu_monitor_thread.start()
-    logger.info("Started GPU monitor thread")
+    monitor_active = True
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    monitor_thread.start()
+    logger.info("Started unified monitor thread")
 
-def monitor_gpu():
-    """Monitor GPU instance health and shut it down if idle for too long or unhealthy"""
-    global gpu_instance, last_job_time, gpu_monitor_active, current_job_id, current_job_data, gpu_launch_time
+def monitor():
+    """Monitor GPU health, job timeouts, and idle time"""
+    global gpu_instance, last_job_time, monitor_active, current_job_id, current_job_data, job_start_time, job_cancel_flag
 
     idle_threshold = timedelta(seconds=GPU_IDLE_TIMEOUT)
-    max_runtime = timedelta(seconds=3600)  # 1 hour maximum runtime
+    max_gpu_runtime = timedelta(seconds=3600)  # 1 hour GPU maximum runtime
 
-    while gpu_monitor_active and gpu_instance is not None:
-        # Check if the instance is healthy
-        if not is_gpu_healthy():
-            logger.warning(f"⚠️ GPU instance {gpu_instance.get('node')} is unhealthy")
+    while monitor_active and gpu_instance is not None:
+        try:
+            # 1. Check GPU health
+            if not is_gpu_healthy():
+                logger.warning(f"GPU instance {gpu_instance.get('node')} is unhealthy")
 
-            # If there's an active job, mark it as failed
-            if current_job_id is not None and current_job_data is not None:
-                logger.error(f"⚠️ GPU instance failed during job execution for job {current_job_id}")
+                # Handle unhealthy GPU for active job
+                if current_job_id is not None and current_job_data is not None:
+                    error_msg = "GPU instance became unhealthy during job execution"
 
-                error_msg = "GPU instance became unhealthy during job execution"
-                update_job_status(current_job_id, "failed", error=error_msg)
-                send_webhook_notification(current_job_id, current_job_data, "failed", error=error_msg)
+                    # Check if the job already has a result_url from partial completion
+                    result_url = redis_client.hget(f"job:{current_job_id}", "result_url")
 
-            # Shut down the GPU instance
-            shutdown_gpu_instance()
-            break
+                    # Mark job as cancelling - this will prevent the job thread from sending a webhook
+                    redis_client.hset(f"job:{current_job_id}", "cancelling", "true")
 
-        # Check if GPU has been running for too long (approaching expiration)
-        if gpu_launch_time and (datetime.now() - gpu_launch_time) > max_runtime:
-            logger.info(f"GPU instance {gpu_instance.get('node')} has been running for over 1 hour.")
+                    # Update job status to failed
+                    update_job_status(current_job_id, "failed", error=error_msg)
 
-            # Only shut down if no active job
-            if current_job_id is None:
-                logger.info("Shutting down to refresh before approaching 2-hour expiration limit.")
-                shutdown_gpu_instance()
-                break
-            else:
-                logger.info("GPU is approaching expiration but has an active job. Will shut down after job completion.")
+                    # Prepare webhook data
+                    webhook_data = {"error": error_msg}
+                    if result_url:
+                        logger.info(f"Including partial result_url in failure webhook for job {current_job_id}")
+                        webhook_data["result_url"] = result_url
 
-        # If no active job, check idle time
-        if current_job_id is None:
-            idle_time = datetime.now() - last_job_time
+                    # Send webhook
+                    send_webhook_notification(current_job_id, current_job_data, "failed", **webhook_data)
 
-            if idle_time > idle_threshold:
-                logger.info(f"GPU instance {gpu_instance.get('node')} has been idle for {idle_time}, shutting down")
+                    # Signal job to terminate
+                    job_cancel_flag = True
+
                 shutdown_gpu_instance()
                 break
 
-            # Log idle status every minute
-            if idle_time.seconds % 60 == 0 and idle_time.seconds > 0:
-                logger.info(f"GPU instance idle for {idle_time}")
+            # 2. Check if GPU has been running too long
+            if gpu_launch_time:
+                gpu_runtime = datetime.now() - gpu_launch_time
+                gpu_time_left = max_gpu_runtime - gpu_runtime
 
-        # Check every 15 seconds for health, slightly faster checking during jobs
-        # and slightly slower during idle to balance responsiveness and efficiency
-        time.sleep(15)
+                if gpu_runtime > max_gpu_runtime:
+                    logger.info(f"GPU instance {gpu_instance.get('node')} has been running for over 1 hour.")
 
-    logger.info("GPU monitor stopped")
+                    if current_job_id is None:
+                        logger.info("Shutting down to refresh before approaching expiration limit.")
+                        shutdown_gpu_instance()
+                        break
+                    else:
+                        logger.info("GPU is approaching expiration but has an active job. Will shut down after job completion.")
+                else:
+                    # Log GPU time remaining every minute
+                    if gpu_runtime.seconds % 60 == 0 and gpu_runtime.seconds > 0:
+                        logger.info(f"GPU instance running for {gpu_runtime.seconds}s, {gpu_time_left.seconds}s remaining until refresh")
+
+            # 3. Check active job status
+            if current_job_id is not None and current_job_data is not None and job_start_time is not None:
+                # Get current time
+                now = time.time()
+                now_readable = datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')
+
+                # Calculate elapsed time
+                elapsed_time = datetime.now() - job_start_time
+
+                # Calculate time remaining for both constraints
+                max_time = int(current_job_data.get("max_time", 1200))  # Default 20 minutes if not provided
+                max_time_remaining = max_time - elapsed_time.total_seconds()
+
+                complete_by = int(current_job_data.get("complete_by", 0))
+                complete_by_remaining = complete_by - now if complete_by > 0 else float('inf')
+
+                # Define complete_by_readable here before it's used
+                complete_by_readable = datetime.fromtimestamp(complete_by).strftime('%Y-%m-%d %H:%M:%S') if complete_by > 0 else "None"
+
+                # Log status on every monitor thread iteration (already runs every 5 seconds)
+                logger.info(f"🏃 JOB RUNNING - Job {current_job_id}: elapsed={elapsed_time.total_seconds():.1f}s, " +
+                           f"max_time_remaining={max_time_remaining:.1f}s, " +
+                           f"complete_by_remaining={complete_by_remaining:.1f}s " +
+                           f"(now={now:.0f}/{now_readable}, complete_by={complete_by}/{complete_by_readable})")
+
+                # 3a. Check for max_time exceeded
+                if elapsed_time.total_seconds() > max_time:
+                    error_msg = f"Job exceeded maximum runtime of {max_time} seconds"
+                    logger.error(f"Job {current_job_id}: {error_msg}")
+
+                    # Check if the job already has a result_url from partial completion
+                    result_url = redis_client.hget(f"job:{current_job_id}", "result_url")
+
+                    # Mark job as cancelling - this will prevent the job thread from sending a webhook
+                    redis_client.hset(f"job:{current_job_id}", "cancelling", "true")
+
+                    # Update job status to failed
+                    update_job_status(current_job_id, "failed", error=error_msg)
+
+                    # Prepare webhook data
+                    webhook_data = {"error": error_msg}
+                    if result_url:
+                        logger.info(f"Including partial result_url in failure webhook for job {current_job_id}")
+                        webhook_data["result_url"] = result_url
+
+                    # Send webhook
+                    send_webhook_notification(current_job_id, current_job_data, "failed", **webhook_data)
+
+                    # Signal job to terminate
+                    job_cancel_flag = True
+
+                    # Reset job tracking
+                    current_job_id = None
+                    current_job_data = None
+                    job_start_time = None
+
+                # 3b. Check for complete_by deadline, but first make sure job hasn't been reset
+                elif complete_by > 0 and current_job_id is not None:
+                    now_readable = datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')
+                    complete_by_readable = datetime.fromtimestamp(complete_by).strftime('%Y-%m-%d %H:%M:%S')
+
+                    # Get created_at timestamp if available
+                    created_at = int(current_job_data.get("created_at", 0))
+                    created_at_readable = datetime.fromtimestamp(created_at).strftime('%Y-%m-%d %H:%M:%S') if created_at > 0 else "unknown"
+
+                    logger.debug(f"Complete_by check: now={now} ({now_readable}) vs complete_by={complete_by} ({complete_by_readable}), " +
+                                f"now > complete_by = {now > complete_by}, created_at={created_at} ({created_at_readable})")
+
+                    if now > complete_by:
+                        error_msg = f"Job exceeded completion deadline (created_at: {created_at_readable}, complete_by: {complete_by_readable})"
+                        logger.error(f"Job {current_job_id}: {error_msg}")
+
+                        # Check if the job already has a result_url from partial completion
+                        result_url = redis_client.hget(f"job:{current_job_id}", "result_url")
+
+                        # Mark job as cancelling - this will prevent the job thread from sending a webhook
+                        redis_client.hset(f"job:{current_job_id}", "cancelling", "true")
+
+                        # Update job status to failed
+                        update_job_status(current_job_id, "failed", error=error_msg)
+
+                        # Prepare webhook data
+                        webhook_data = {"error": error_msg}
+                        if result_url:
+                            logger.info(f"Including partial result_url in failure webhook for job {current_job_id}")
+                            webhook_data["result_url"] = result_url
+
+                        # Send webhook
+                        send_webhook_notification(current_job_id, current_job_data, "failed", **webhook_data)
+
+                        # Signal job to terminate
+                        job_cancel_flag = True
+
+                        # Reset job tracking
+                        current_job_id = None
+                        current_job_data = None
+                        job_start_time = None
+
+            # 4. Check idle time if no active job
+            elif current_job_id is None:
+                idle_time = datetime.now() - last_job_time
+
+                if idle_time > idle_threshold:
+                    logger.info(f"GPU instance {gpu_instance.get('node')} has been idle for {idle_time}, shutting down")
+                    shutdown_gpu_instance()
+                    break
+
+                # Log idle status every minute
+                if idle_time.seconds % 60 == 0 and idle_time.seconds > 0:
+                    logger.info(f"GPU instance idle for {idle_time}")
+
+            # Check every 5 seconds for better responsiveness to timeouts
+            time.sleep(5)
+        except Exception as e:
+            logger.exception(f"Error in monitor thread: {e}")
+            # Continue the loop to maintain monitoring despite errors
+
+    logger.info("Monitor stopped")
 
 def get_gpu_instance():
     """Get or create a GPU instance for processing"""
@@ -397,8 +531,8 @@ def get_gpu_instance():
         node_hostname = result.get('node')
         logger.info(f"Successfully launched GPU instance: {node_hostname} at {gpu_launch_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # Start the GPU monitor if not already running
-        start_gpu_monitor()
+        # Start the monitor if not already running
+        start_monitor()
 
         # Wait for the instance to initialize
         logger.info("Waiting for GPU instance to initialize...")
@@ -418,7 +552,7 @@ def get_gpu_instance():
 
 def shutdown_gpu_instance():
     """Shut down the current GPU instance"""
-    global gpu_instance, gpu_monitor_active, current_job_id, current_job_data, gpu_launch_time
+    global gpu_instance, monitor_active, current_job_id, current_job_data, gpu_launch_time
 
     if gpu_instance is None:
         return
@@ -431,7 +565,7 @@ def shutdown_gpu_instance():
     current_job_data = None
 
     # Stop GPU monitoring
-    gpu_monitor_active = False
+    monitor_active = False
 
     logger.info(f"Shutting down GPU instance {node_hostname} (ID: {node_id})...")
     result = stop_workload(node_id)
@@ -571,26 +705,19 @@ def send_webhook_notification(job_id, job_data, status, **kwargs):
         logger.exception(f"Error sending webhook notification: {str(e)}")
         return False
 
-def process_csm_job(job_id, job_data, gpu_instance):
+def process_csm_job(job_id, job_data, gpu_instance, cancel_checker=None):
     """Process a text-to-speech job"""
-    global current_job_id, current_job_data
-
     logger.info(f"Processing CSM job: {job_id}")
 
     try:
-        # Set current job for monitoring
-        current_job_id = job_id
-        current_job_data = job_data
-
         # Generate speech from text using CSM
-        audio_file = csm.text_to_speech_with_csm(job_data.get("data", "{}"), job_id, gpu_instance, api_key, OUTPUT_DIR)
+        audio_file = csm.text_to_speech_with_csm(job_data.get("data", "{}"), job_id, gpu_instance, api_key, OUTPUT_DIR, cancel_checker)
 
         # Save the output path (we're not uploading to Minio yet)
         result_url = upload_to_storage(audio_file)
 
-        # Update job status and send notification
+        # Update job status in Redis (no webhook)
         update_job_status(job_id, "success", result_url=result_url)
-        send_webhook_notification(job_id, job_data, "success", result_url=result_url, local_path=audio_file)
 
         # Note: We're not cleaning up the file since we want to keep it in the output directory
         return True
@@ -598,18 +725,13 @@ def process_csm_job(job_id, job_data, gpu_instance):
     except Exception as e:
         error_msg = f"Error processing CSM job: {str(e)}"
         logger.exception(error_msg)
+
+        # Only update the job status in Redis (no webhook)
         update_job_status(job_id, "failed", error=error_msg)
-        send_webhook_notification(job_id, job_data, "failed", error=error_msg)
         return False
-    finally:
-        # Clear job tracking
-        current_job_id = None
-        current_job_data = None
 
-def process_whisper_job(job_id, job_data, gpu_instance):
+def process_whisper_job(job_id, job_data, gpu_instance, cancel_checker=None):
     """Process a speech-to-text job"""
-    global current_job_id, current_job_data
-
     logger.info(f"Processing Whisper job: {job_id}")
 
     try:
@@ -620,34 +742,23 @@ def process_whisper_job(job_id, job_data, gpu_instance):
 
         logger.info(f"Job parameters: audio_url={audio_url}, model={model}")
 
-        # Set current job for monitoring
-        current_job_id = job_id
-        current_job_data = job_data
-
         # Process with Whisper
-        transcription = whisper.speech_to_text_with_whisper(job_data.get("data", "{}"), job_id, gpu_instance, api_key, OUTPUT_DIR)
+        transcription = whisper.speech_to_text_with_whisper(job_data.get("data", "{}"), job_id, gpu_instance, api_key, OUTPUT_DIR, cancel_checker)
 
-        # Update job status and send notification
+        # Update job status (no webhook)
         update_job_status(job_id, "success", result=transcription)
-        send_webhook_notification(job_id, job_data, "success", text=transcription)
-
         return True
 
     except Exception as e:
         error_msg = f"Error processing Whisper job: {str(e)}"
         logger.exception(error_msg)
+
+        # Only update job status in Redis (no webhook)
         update_job_status(job_id, "failed", error=error_msg)
-        send_webhook_notification(job_id, job_data, "failed", error=error_msg)
         return False
-    finally:
-        # Clear job tracking
-        current_job_id = None
-        current_job_data = None
 
-def process_portrait_job(job_id, job_data, gpu_instance):
+def process_portrait_job(job_id, job_data, gpu_instance, cancel_checker=None):
     """Process a portrait video job using ComfyUI"""
-    global current_job_id, current_job_data
-
     logger.info(f"Processing Portrait job: {job_id}")
 
     try:
@@ -658,54 +769,59 @@ def process_portrait_job(job_id, job_data, gpu_instance):
 
         logger.info(f"Job parameters: image_url={image_url}, audio_url={audio_url}")
 
-        # Set current job for monitoring
-        current_job_id = job_id
-        current_job_data = job_data
-
         # Run portrait generation using ComfyUI
-        result = comfyui.generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key, OUTPUT_DIR)
+        result = comfyui.generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key, OUTPUT_DIR, cancel_checker)
 
         # Handle result based on return type
         if isinstance(result, tuple) and len(result) == 2 and result[0] is False:
             # This is an error with detailed message
             _, detailed_error = result
-            error_msg = f"Failed to generate portrait video: {detailed_error}"
+
+            # Check if the detailed error is a dictionary with error and result_url
+            result_url = None
+            if isinstance(detailed_error, dict) and 'error' in detailed_error:
+                error_msg = f"Failed to generate portrait video: {detailed_error['error']}"
+                if 'result_url' in detailed_error:
+                    result_url = detailed_error['result_url']
+                    logger.info(f"Got partial result URL from ComfyUI cancellation: {result_url}")
+                    # Save the result URL for future reference
+                    redis_client.hset(f"job:{job_id}", "result_url", result_url)
+            else:
+                error_msg = f"Failed to generate portrait video: {detailed_error}"
+
             logger.error(error_msg)
+
+            # Update job status in Redis (no webhook)
             update_job_status(job_id, "failed", error=error_msg)
-            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
             return False
+
         elif result:
             # This is a successful result with video path
             video_output_path = result
             # Save the result URL
             result_url = upload_to_storage(video_output_path)
 
-            # Update job status and send notification
+            # Update job status in Redis (no webhook)
             update_job_status(job_id, "success", result_url=result_url)
-            send_webhook_notification(job_id, job_data, "success", result_url=result_url)
             return True
         else:
             # Backward compatibility for old return format (just False)
             error_msg = "Failed to generate portrait video"
+
+            # Update job status in Redis (no webhook)
             update_job_status(job_id, "failed", error=error_msg)
-            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
             return False
 
     except Exception as e:
         error_msg = f"Error processing Portrait job: {str(e)}"
         logger.exception(error_msg)
+
+        # Update job status in Redis (no webhook)
         update_job_status(job_id, "failed", error=error_msg)
-        send_webhook_notification(job_id, job_data, "failed", error=error_msg)
         return False
-    finally:
-        # Clear job tracking
-        current_job_id = None
-        current_job_data = None
 
-def process_analyze_job(job_id, job_data, gpu_instance):
+def process_analyze_job(job_id, job_data, gpu_instance, cancel_checker=None):
     """Process an image analysis job"""
-    global current_job_id, current_job_data
-
     logger.info(f"Processing Analyze job: {job_id}")
 
     try:
@@ -714,10 +830,6 @@ def process_analyze_job(job_id, job_data, gpu_instance):
         image_url = job_params.get("image_url")
 
         logger.info(f"Job parameters: image_url={image_url}")
-
-        # Set current job for monitoring
-        current_job_id = job_id
-        current_job_data = job_data
 
         # TODO: Connect to vision model API
         # TODO: Download image from URL to output directory with job ID filename
@@ -729,20 +841,13 @@ def process_analyze_job(job_id, job_data, gpu_instance):
         # For now, just simulate success
         result_text = "This is a simulated image analysis result"
         update_job_status(job_id, "success", result=result_text)
-        send_webhook_notification(job_id, job_data, "success", text=result_text)
-
         return True
 
     except Exception as e:
         error_msg = f"Error processing Analyze job: {str(e)}"
         logger.exception(error_msg)
         update_job_status(job_id, "failed", error=error_msg)
-        send_webhook_notification(job_id, job_data, "failed", error=error_msg)
         return False
-    finally:
-        # Clear job tracking
-        current_job_id = None
-        current_job_data = None
 
 def update_job_status(job_id, status, **kwargs):
     """Update job status in Redis"""
@@ -752,7 +857,10 @@ def update_job_status(job_id, status, **kwargs):
     for key, value in kwargs.items():
         redis_client.hset(f"job:{job_id}", key, value)
 
-    logger.info(f"Updated job {job_id} status to {status}")
+    if status == "running":
+        logger.info(f"🏃 JOB RUNNING - Updated job {job_id} status to {status}")
+    else:
+        logger.info(f"Updated job {job_id} status to {status}")
 
 def safely_peek_job():
     """Check if there's a job in the queue without removing it"""
@@ -798,128 +906,369 @@ def safely_claim_job(job_id):
         return False
 
 def process_job(job_id, gpu_instance):
-    """Process a job based on its type"""
-    logger.info(f"Processing job {job_id}")
+    """Set up job for processing in a separate thread"""
+    global current_job_id, current_job_data, job_start_time, job_thread, job_cancel_flag
 
     # Get job data from Redis
     job_data = redis_client.hgetall(f"job:{job_id}")
-
     if not job_data:
         logger.error(f"Job {job_id} not found in Redis")
-        return True  # Return True to indicate the GPU is still usable
+        return True
+
+    # Reset cancel flag
+    job_cancel_flag = False
+
+    # Set tracking variables
+    current_job_id = job_id
+    current_job_data = job_data
+    job_start_time = datetime.now()
 
     # Update job status to running
-    redis_client.hset(f"job:{job_id}", "status", "running")
+    update_job_status(job_id, "running")
 
-    job_success = False
+    # Create thread for job processing
+    job_thread = threading.Thread(
+        target=_job_runner_thread,
+        args=(job_id, job_data, gpu_instance)
+    )
+    job_thread.daemon = True
+    job_thread.start()
+
+    logger.info(f"🏃 JOB RUNNING - Started processing thread for job {job_id}")
+    return True
+
+def _job_runner_thread(job_id, job_data, gpu_instance):
+    """Thread that runs the actual job processing"""
+    global job_cancel_flag
     try:
-        # Process based on job type
+        # Get job type
         job_type = job_data.get("type")
+        logger.info(f"🏃 JOB RUNNING - Job thread started for {job_type} job {job_id}")
 
+        # Create a cancel check function to pass to render engines
+        def check_cancellation():
+            return job_cancel_flag
+
+        # Process based on job type
+        success = False
         if job_type == "csm":
-            job_success = process_csm_job(job_id, job_data, gpu_instance)
+            success = process_csm_job(job_id, job_data, gpu_instance, check_cancellation)
         elif job_type == "whisper":
-            job_success = process_whisper_job(job_id, job_data, gpu_instance)
+            success = process_whisper_job(job_id, job_data, gpu_instance, check_cancellation)
         elif job_type == "portrait":
-            job_success = process_portrait_job(job_id, job_data, gpu_instance)
+            success = process_portrait_job(job_id, job_data, gpu_instance, check_cancellation)
         elif job_type == "analyze":
-            job_success = process_analyze_job(job_id, job_data, gpu_instance)
+            success = process_analyze_job(job_id, job_data, gpu_instance, check_cancellation)
         else:
             error_msg = f"Unknown job type: {job_type}"
             logger.error(error_msg)
-            redis_client.hset(f"job:{job_id}", "status", "failed")
-            redis_client.hset(f"job:{job_id}", "error", error_msg)
-            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
-            job_success = True  # Unknown job type doesn't mean GPU is bad
+            update_job_status(job_id, "failed", error=error_msg)
 
+        # Retrieve the current status and info from Redis
+        job_info = redis_client.hgetall(f"job:{job_id}")
+        job_status = job_info.get("status", "unknown")
+
+        # Check if job is already being cancelled by the monitor thread
+        is_cancelling = job_info.get("cancelling") == "true"
+
+        # Only send webhook if the monitor thread hasn't already sent one
+        if not is_cancelling:
+            # Get any result URL or error message
+            result_url = job_info.get("result_url")
+            error_msg = job_info.get("error")
+            result_text = job_info.get("result")
+
+            # Send webhook with the appropriate data
+            if job_status == "success":
+                logger.info(f"Sending success webhook for job {job_id}")
+                webhook_data = {}
+
+                # Include the appropriate result data based on job type
+                if result_url:
+                    webhook_data["result_url"] = result_url
+                if result_text:
+                    webhook_data["text"] = result_text
+
+                send_webhook_notification(job_id, job_data, "success", **webhook_data)
+            elif job_status == "failed":
+                logger.info(f"Sending failure webhook for job {job_id}")
+                webhook_data = {}
+
+                if error_msg:
+                    webhook_data["error"] = error_msg
+                if result_url:
+                    logger.info(f"Including partial result_url in failure webhook for job {job_id}")
+                    webhook_data["result_url"] = result_url
+
+                send_webhook_notification(job_id, job_data, "failed", **webhook_data)
+        else:
+            logger.info(f"Job {job_id} is marked as cancelling, monitor thread is handling the webhook")
+
+        logger.info(f"Job thread completed for {job_id} with success={success}")
     except Exception as e:
-        error_msg = f"Error processing job: {str(e)}"
+        error_msg = f"Error in job thread: {str(e)}"
         logger.exception(error_msg)
-        redis_client.hset(f"job:{job_id}", "status", "failed")
-        redis_client.hset(f"job:{job_id}", "error", error_msg)
-        send_webhook_notification(job_id, job_data, "failed", error=error_msg)
-        job_success = False  # Unexpected error might indicate GPU problems
 
-    return job_success  # Return whether job was successful to indicate if GPU is still usable
+        # Update job status
+        update_job_status(job_id, "failed", error=error_msg)
+
+        # Check if job is being cancelled by the monitor thread
+        is_cancelling = redis_client.hget(f"job:{job_id}", "cancelling") == "true"
+
+        # Only send webhook if not already being cancelled
+        if not is_cancelling:
+            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+
+def lock_job(job_id, worker_id, lock_timeout=300):
+    """
+    Try to lock a job for a worker
+
+    Args:
+        job_id: The job ID to lock
+        worker_id: Unique ID of this worker instance
+        lock_timeout: Seconds until lock expires (prevents stuck jobs if worker crashes)
+
+    Returns:
+        True if lock acquired, False otherwise
+    """
+    # Use Lua script for atomic operations
+    lock_script = """
+    local job_key = KEYS[1]
+    local worker_id = ARGV[1]
+    local lock_timeout = ARGV[2]
+
+    -- Check if job exists
+    if redis.call('EXISTS', job_key) == 0 then
+        return 0
+    end
+
+    -- Check if already locked
+    local locked_by = redis.call('HGET', job_key, 'locked_by')
+    if locked_by and locked_by ~= '' then
+        return 0
+    end
+
+    -- Set lock
+    redis.call('HSET', job_key, 'locked_by', worker_id)
+    redis.call('HSET', job_key, 'locked_at', redis.call('TIME')[1])
+
+    -- Set lock expiration (separate key with same timeout)
+    local lock_key = job_key .. ':lock'
+    redis.call('SET', lock_key, worker_id, 'EX', lock_timeout)
+
+    return 1
+    """
+
+    try:
+        result = redis_client.eval(
+            lock_script,
+            1,  # 1 key
+            f"job:{job_id}",  # KEYS[1]
+            worker_id,  # ARGV[1]
+            lock_timeout  # ARGV[2]
+        )
+        return result == 1
+    except Exception as e:
+        logger.error(f"Error locking job {job_id}: {e}")
+        return False
+
+def release_job_lock(job_id, worker_id):
+    """Release a job lock if it's held by this worker"""
+    release_script = """
+    local job_key = KEYS[1]
+    local lock_key = job_key .. ':lock'
+    local worker_id = ARGV[1]
+
+    -- Check if we own the lock
+    local locked_by = redis.call('HGET', job_key, 'locked_by')
+    if locked_by == worker_id then
+        -- Release the lock
+        redis.call('HDEL', job_key, 'locked_by')
+        redis.call('HDEL', job_key, 'locked_at')
+        redis.call('DEL', lock_key)
+        return 1
+    end
+
+    return 0
+    """
+
+    try:
+        result = redis_client.eval(
+            release_script,
+            1,  # 1 key
+            f"job:{job_id}",  # KEYS[1]
+            worker_id  # ARGV[1]
+        )
+        return result == 1
+    except Exception as e:
+        logger.error(f"Error releasing job lock {job_id}: {e}")
+        return False
+
+def dequeue_job(job_id, worker_id):
+    """
+    Permanently remove job from queue if we have the lock
+    Returns True if dequeued, False otherwise
+    """
+    dequeue_script = """
+    local job_id = ARGV[1]
+    local queue_key = KEYS[1]
+    local job_key = KEYS[2]
+    local worker_id = ARGV[2]
+
+    -- Check if we own the lock
+    local locked_by = redis.call('HGET', job_key, 'locked_by')
+    if locked_by == worker_id then
+        -- Remove from queue
+        redis.call('LREM', queue_key, 1, job_id)
+        return 1
+    end
+
+    return 0
+    """
+
+    try:
+        result = redis_client.eval(
+            dequeue_script,
+            2,  # 2 keys
+            JOB_QUEUE,  # KEYS[1]
+            f"job:{job_id}",  # KEYS[2]
+            job_id,  # ARGV[1]
+            worker_id  # ARGV[2]
+        )
+        return result == 1
+    except Exception as e:
+        logger.error(f"Error dequeuing job {job_id}: {e}")
+        return False
+
+def check_job_expired(job_id):
+    """Check if a job has expired based on complete_by timestamp"""
+    try:
+        job_data = redis_client.hgetall(f"job:{job_id}")
+        if not job_data:
+            return False  # Job not found, can't be expired
+
+        complete_by = int(job_data.get("complete_by", 0))
+        if complete_by > 0 and time.time() > complete_by:
+            logger.info(f"Job {job_id} has expired (complete_by: {complete_by})")
+            return True
+
+        return False
+    except Exception as e:
+        logger.error(f"Error checking job expiration: {e}")
+        return False  # Assume not expired on error
+
+def handle_expired_job(job_id):
+    """Mark a job as failed due to expiration and remove from queue"""
+    try:
+        # Get job data
+        job_data = redis_client.hgetall(f"job:{job_id}")
+        if not job_data:
+            return False
+
+        # Mark as failed
+        error_msg = "Job expired before processing could begin"
+        update_job_status(job_id, "failed", error=error_msg)
+
+        # Only send webhook if not already being handled
+        is_cancelling = job_data.get("cancelling") == "true"
+        if not is_cancelling:
+            # Send webhook notification
+            send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+
+        # Remove from queue
+        redis_client.lrem(JOB_QUEUE, 1, job_id)
+
+        logger.info(f"Removed expired job {job_id} from queue")
+        return True
+    except Exception as e:
+        logger.error(f"Error handling expired job: {e}")
+        return False
 
 def main():
     """Main worker loop"""
-    global gpu_instance, last_job_time, gpu_launch_time
+    global gpu_instance, last_job_time
 
-    logger.info("Starting C3 Render Worker")
+    logger.info(f"Starting C3 Render Worker with ID: {WORKER_ID}")
+    logger.info(f"Using polling interval: Queue check={QUEUE_CHECK_INTERVAL}s")
 
     try:
         while True:
-            # Peek at the job queue without removing anything
-            job_id = safely_peek_job()
+            # Skip claiming new jobs if we're already processing one
+            if current_job_id is not None:
+                logger.debug(f"Currently processing job {current_job_id}, waiting before checking queue again")
+                time.sleep(QUEUE_CHECK_INTERVAL)
+                continue
 
-            if job_id:
-                logger.info(f"Found job in queue: {job_id}")
+            # Get all jobs from the queue (up to 10 to avoid excessive load)
+            jobs = redis_client.lrange(JOB_QUEUE, 0, 9)
 
-                # Check if we already have a healthy GPU that's not too old
-                gpu_too_old = False
-                if gpu_instance is not None and gpu_launch_time and (datetime.now() - gpu_launch_time).total_seconds() > 3600:
-                    logger.info(f"GPU instance {gpu_instance.get('node')} has been running for over 1 hour. Will refresh after handling this job.")
-                    gpu_too_old = True
+            if jobs:
+                # Jobs exist in queue, try to process one
+                processed_job = False
 
-                if gpu_instance is not None and is_gpu_healthy():
-                    # We have a GPU, claim the job immediately
-                    if safely_claim_job(job_id):
-                        logger.info(f"Successfully claimed job {job_id} with existing GPU")
+                # Apply standard delay based on GPU availability
+                # This ensures workers with GPUs get priority by responding faster
+                delay = GPU_WORKER_DELAY if (gpu_instance and is_gpu_healthy()) else NO_GPU_WORKER_DELAY
+                logger.debug(f"Applying {delay}s delay for job processing (has_gpu={gpu_instance is not None})")
+                time.sleep(delay)
 
-                        # Process the job and check if the GPU is still usable
-                        gpu_still_usable = process_job(job_id, gpu_instance)
+                # Try each job in the queue until we successfully process one
+                for job_id in jobs:
+                    # Check if expired first
+                    if check_job_expired(job_id):
+                        handle_expired_job(job_id)
+                        continue
 
-                        if not gpu_still_usable:
-                            logger.warning("Job processing reported GPU issues. Shutting down GPU instance.")
-                            shutdown_gpu_instance()
-                        else:
-                            # Update last job time since the GPU was used successfully
-                            last_job_time = datetime.now()
+                    # Make sure job is still in the queue
+                    if job_id not in redis_client.lrange(JOB_QUEUE, 0, 9):
+                        logger.debug(f"Job {job_id} was claimed by another worker")
+                        continue
 
-                            # Shut down GPU if it's too old (over 1 hour) after finishing the job
-                            if gpu_too_old:
-                                logger.info("Shutting down GPU that's been running for over 1 hour to refresh before expiration.")
-                                shutdown_gpu_instance()
-                else:
-                    # No GPU available, wait before launching a new one
-                    random_delay = random.randint(PRE_LAUNCH_TIMEOUT_MIN, PRE_LAUNCH_TIMEOUT_MAX)
-                    logger.info(f"No GPU available. Waiting {random_delay} seconds before launching...")
-                    time.sleep(random_delay)
+                    logger.debug(f"Attempting to lock job {job_id}")
 
-                    # Check if the job is still in the queue
-                    if job_id == safely_peek_job():
-                        logger.info(f"Job {job_id} still in queue after waiting. Launching GPU...")
+                    # Try to lock the job
+                    if lock_job(job_id, WORKER_ID):
+                        logger.info(f"Successfully locked job {job_id}")
 
-                        # Get or launch a GPU
-                        gpu_instance = get_gpu_instance()
+                        try:
+                            # Now we have the lock, try to get a GPU if needed
+                            if gpu_instance is None or not is_gpu_healthy():
+                                logger.info("Launching GPU for locked job")
+                                gpu_instance = get_gpu_instance()
 
-                        if gpu_instance:
-                            # Successfully got a GPU, try to claim the job
-                            if safely_claim_job(job_id):
-                                logger.info(f"Successfully claimed job {job_id} with newly launched GPU")
+                            if gpu_instance:
+                                # Successfully got GPU, dequeue the job
+                                if dequeue_job(job_id, WORKER_ID):
+                                    logger.info(f"Successfully dequeued job {job_id}")
 
-                                # Process the job and check if the GPU is still usable
-                                gpu_still_usable = process_job(job_id, gpu_instance)
+                                    # Initialize/start the monitor if not running
+                                    start_monitor()
 
-                                if not gpu_still_usable:
-                                    logger.warning("Job processing reported GPU issues. Shutting down GPU instance.")
-                                    shutdown_gpu_instance()
-                                else:
-                                    # Update last job time since the GPU was used successfully
+                                    # Process the job
+                                    process_job(job_id, gpu_instance)
                                     last_job_time = datetime.now()
+                                    processed_job = True
+                                    break  # Exit the loop after processing a job
+                                else:
+                                    logger.warning(f"Failed to dequeue job {job_id} despite having lock")
+                                    release_job_lock(job_id, WORKER_ID)
                             else:
-                                # Failed to claim the job after launching a GPU (another worker got it first)
-                                logger.info(f"Launched GPU but job {job_id} was claimed by another worker. Shutting down GPU to avoid waste.")
-                                shutdown_gpu_instance()
-                        else:
-                            logger.warning(f"Failed to launch GPU. Job {job_id} remains in queue and will be retried.")
+                                logger.error("Failed to get GPU for locked job")
+                                release_job_lock(job_id, WORKER_ID)
+                        except Exception as e:
+                            logger.exception(f"Error processing locked job: {e}")
+                            release_job_lock(job_id, WORKER_ID)
                     else:
-                        logger.info(f"Job {job_id} was claimed by another worker during wait period.")
+                        logger.debug(f"Job {job_id} is locked by another worker, trying next job")
+                        # No sleep here, continue to next job immediately
 
-            # Small delay to avoid hammering Redis if no jobs
-            time.sleep(0.1)
-
+                # If no job could be processed after trying all in the queue, add a short sleep
+                if not processed_job:
+                    logger.debug("Could not process any job in the queue, all locked or expired")
+                    time.sleep(QUEUE_CHECK_INTERVAL)  # Use consistent QUEUE_CHECK_INTERVAL instead of LOCK_RETRY_INTERVAL
+            else:
+                # No jobs in queue, small sleep to avoid hammering Redis
+                time.sleep(QUEUE_CHECK_INTERVAL)
     except KeyboardInterrupt:
         logger.info("Shutting down worker")
         if gpu_instance:

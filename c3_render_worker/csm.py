@@ -9,7 +9,7 @@ import subprocess
 from gradio_client import Client, handle_file
 
 # Import from constants file
-from constants import MAX_RENDER_TIME, RENDER_POLLING_INTERVAL
+from constants import RENDER_POLLING_INTERVAL
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ def convert_to_mono(audio_path):
         logger.warning(f"Error converting audio to mono: {str(e)}. Using original audio.")
         return audio_path
 
-def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
+def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir, cancel_callback=None):
     """Generate speech from text using CSM with configurable voice options"""
     logger.info(f"Generating speech with CSM: {text[:50]}...")
 
@@ -232,29 +232,45 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
             predict_params["speaker_text"] = ""  # No reference text needed for built-in voices
             predict_params["speaker_audio"] = None  # No reference audio needed for built-in voices
 
-        # Set up timeout tracking
+        # Set up timing tracking for logging purposes only
         start_time = time.time()
-        max_wait_time = MAX_RENDER_TIME
 
-        # Use the client with a custom progress tracking function to handle timeouts
-        logger.info(f"Starting CSM generation with {max_wait_time}s timeout")
+        # Use the client with a custom progress tracking function
+        logger.info("Starting CSM generation")
 
         result = None
 
         # Submit the prediction request and start tracking
         job = client.submit(**predict_params)
 
-        # Poll for completion with timeout
+        # Poll for completion
         while True:
-            elapsed_time = time.time() - start_time
-
-            if elapsed_time > max_wait_time:
-                logger.error(f"CSM generation timed out after {max_wait_time} seconds")
+            # Check for cancellation request
+            if cancel_callback and cancel_callback():
+                logger.warning("Job cancellation detected - terminating CSM generation")
                 # Try to cancel the job if possible
                 try:
                     job.cancel()
-                except:
-                    pass
+                    logger.info("Sent cancellation request to CSM")
+                except Exception as e:
+                    logger.warning(f"Error cancelling CSM job: {e}")
+
+                # Get the specific error message from Redis if available
+                try:
+                    from redis import Redis
+                    redis_host = os.getenv("REDIS_HOST", "localhost")
+                    redis_port = int(os.getenv("REDIS_PORT", "6379"))
+                    redis_client = Redis(host=redis_host, port=redis_port, decode_responses=True)
+
+                    job_data = redis_client.hgetall(f"job:{job_id}")
+                    if job_data and "error" in job_data:
+                        error_msg = job_data["error"]
+                        logger.info(f"Using specific error reason from Redis: {error_msg}")
+                    else:
+                        error_msg = "Job was cancelled by system"
+                except Exception as e:
+                    logger.warning(f"Error retrieving specific error message: {e}")
+                    error_msg = "Job was cancelled by system"
 
                 # Clean up reference audio files if they exist
                 if 'reference_audio_file' in locals() and reference_audio_file and os.path.exists(reference_audio_file):
@@ -265,7 +281,9 @@ def text_to_speech_with_csm(text, job_id, gpu_instance, api_key, output_dir):
                     os.unlink(mono_audio_file)
                     logger.info(f"Cleaned up mono audio file {mono_audio_file}")
 
-                raise Exception(f"Text-to-speech generation timed out after {max_wait_time} seconds")
+                raise Exception(error_msg)
+
+            elapsed_time = time.time() - start_time
 
             # Check if job is done
             if job.done():

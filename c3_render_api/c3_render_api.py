@@ -16,6 +16,10 @@ import time
 # Load environment variables
 load_dotenv()
 
+# Define constants directly
+DEFAULT_COMPLETE_IN = int(os.getenv("DEFAULT_COMPLETE_IN", "3600"))  # 1 hour from now
+DEFAULT_MAX_TIME = int(os.getenv("DEFAULT_MAX_TIME", "1200"))  # 20 minutes max runtime
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -41,11 +45,30 @@ C3_API_KEY = os.getenv("C3_API_KEY")
 def create_job(job_type: str, data: Dict[str, Any]) -> str:
     """Create a new job and add it to Redis queue"""
     job_id = str(uuid.uuid4())
+
+    # Use Unix timestamp consistently
+    now = int(time.time())
+
+    # Handle complete_in (relative deadline)
+    if "complete_in" in data:
+        complete_in = int(data.pop("complete_in"))  # Remove from job params
+        complete_by = now + complete_in
+    else:
+        complete_by = now + DEFAULT_COMPLETE_IN
+
+    # Handle max_time (maximum runtime)
+    if "max_time" in data:
+        max_time = int(data.pop("max_time"))  # Remove from job params
+    else:
+        max_time = DEFAULT_MAX_TIME
+
     job_data = {
         "id": job_id,
         "type": job_type,
         "status": "queued",
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": now,  # Use Unix timestamp consistently
+        "complete_by": complete_by,
+        "max_time": max_time,
         "data": json.dumps(data)  # Store data as JSON string
     }
 
@@ -55,7 +78,7 @@ def create_job(job_type: str, data: Dict[str, Any]) -> str:
     # Add to the single processing queue
     redis_client.rpush(JOB_QUEUE, job_id)
 
-    logger.info(f"Created {job_type} job {job_id}")
+    logger.info(f"Created {job_type} job {job_id} (complete_by: {complete_by}, max_time: {max_time})")
 
     return job_id
 
@@ -98,8 +121,26 @@ def validate_int(value: Any, min_val: int = None, max_val: int = None) -> bool:
     except:
         return False
 
+def validate_timing_params(data: Dict[str, Any]) -> Tuple[bool, str]:
+    """Validate timing parameters for all jobs"""
+    # Validate complete_in if provided
+    if "complete_in" in data:
+        if not validate_int(data["complete_in"], 60, 86400):  # Between 1 minute and 24 hours
+            return False, "complete_in must be an integer between 60 and 86400 seconds"
+
+    # Validate max_time if provided
+    if "max_time" in data and not validate_int(data["max_time"], 60, 7200):
+        return False, "max_time must be an integer between 60 and 7200 seconds"
+
+    return True, ""
+
 def validate_csm_params(data: Dict[str, Any]) -> Tuple[bool, str]:
     """Validate parameters for CSM text-to-speech"""
+    # Validate timing parameters first
+    is_valid, error_message = validate_timing_params(data)
+    if not is_valid:
+        return False, error_message
+
     # Check that at least one of text or monologue is provided
     if not data or ("text" not in data and "monologue" not in data):
         return False, "Missing required field: either text or monologue must be provided"
@@ -173,6 +214,11 @@ def validate_csm_params(data: Dict[str, Any]) -> Tuple[bool, str]:
 
 def validate_whisper_params(data: Dict[str, Any]) -> Tuple[bool, str]:
     """Validate parameters for Whisper speech-to-text"""
+    # Validate timing parameters first
+    is_valid, error_message = validate_timing_params(data)
+    if not is_valid:
+        return False, error_message
+
     # Check for required field
     if not data or "audio_url" not in data:
         return False, "Missing required field: audio_url"
@@ -206,10 +252,14 @@ def validate_whisper_params(data: Dict[str, Any]) -> Tuple[bool, str]:
 
 def validate_portrait_params(data: Dict[str, Any]) -> Dict[str, str]:
     """Validate parameters for portrait job"""
-    required_fields = ["image_url", "audio_url"]
     errors = {}
 
-    # Check for required fields
+    # Validate timing parameters
+    is_valid, error_message = validate_timing_params(data)
+    if not is_valid:
+        errors["timing"] = error_message
+
+    required_fields = ["image_url", "audio_url"]
     for field in required_fields:
         if field not in data or not data[field]:
             errors[field] = f"Missing required field: {field}"
@@ -227,6 +277,11 @@ def validate_portrait_params(data: Dict[str, Any]) -> Dict[str, str]:
 
 def validate_analyze_params(data: Dict[str, Any]) -> Tuple[bool, str]:
     """Validate parameters for image analysis"""
+    # Validate timing parameters first
+    is_valid, error_message = validate_timing_params(data)
+    if not is_valid:
+        return False, error_message
+
     # Check for required field
     if not data or "image_url" not in data:
         return False, "Missing required field: image_url"
@@ -243,7 +298,12 @@ def validate_analyze_params(data: Dict[str, Any]) -> Tuple[bool, str]:
 
 @app.route("/csm", methods=["POST"])
 def text_to_speech():
-    """Text-to-speech endpoint with voice cloning"""
+    """Text-to-speech endpoint with voice cloning
+
+    Optional parameters:
+        max_time: Maximum runtime in seconds for this job (60-7200, default: 1200)
+        complete_in: Number of seconds from now when job must complete (60-86400, default: 3600)
+    """
     try:
         data = request.get_json()
 
@@ -264,7 +324,12 @@ def text_to_speech():
 
 @app.route("/whisper", methods=["POST"])
 def speech_to_text():
-    """Speech-to-text endpoint"""
+    """Speech-to-text endpoint
+
+    Optional parameters:
+        max_time: Maximum runtime in seconds for this job (60-7200, default: 1200)
+        complete_in: Number of seconds from now when job must complete (60-86400, default: 3600)
+    """
     try:
         data = request.get_json()
 
@@ -295,7 +360,12 @@ def speech_to_text():
 
 @app.route("/portrait", methods=["POST"])
 def portrait_endpoint():
-    """Text-to-video portrait endpoint"""
+    """Text-to-video portrait endpoint
+
+    Optional parameters:
+        max_time: Maximum runtime in seconds for this job (60-7200, default: 1200)
+        complete_in: Number of seconds from now when job must complete (60-86400, default: 3600)
+    """
     try:
         # Get request data
         data = request.get_json()
@@ -309,25 +379,9 @@ def portrait_endpoint():
             logger.error(f"Portrait validation errors: {json.dumps(validation_errors)}")
             return jsonify({"errors": validation_errors}), 400
 
-        # Generate a unique job ID
-        job_id = str(uuid.uuid4())
-
-        # Store job in Redis
-        job_data = {
-            "id": job_id,
-            "type": "portrait",
-            "status": "queued",
-            "data": json.dumps(data),
-            "created_at": time.time()
-        }
-
-        redis_client.hset(f"job:{job_id}", mapping=job_data)
-        redis_client.rpush(JOB_QUEUE, job_id)
-
-        logger.info(f"Created portrait job {job_id}")
-
-        # Return job ID
-        return jsonify({"id": job_id, "status": "queued"}), 200
+        # Create job after validation
+        job_id = create_job("portrait", data)
+        return jsonify({"id": job_id, "status": "queued"})
     except Exception as e:
         error_details = traceback.format_exc()
         logger.exception(f"Error processing Portrait request: {str(e)}\n{error_details}")
@@ -335,7 +389,12 @@ def portrait_endpoint():
 
 @app.route("/analyze", methods=["POST"])
 def image_analysis():
-    """Image analysis endpoint"""
+    """Image analysis endpoint
+
+    Optional parameters:
+        max_time: Maximum runtime in seconds for this job (60-7200, default: 1200)
+        complete_in: Number of seconds from now when job must complete (60-86400, default: 3600)
+    """
     try:
         data = request.get_json()
 

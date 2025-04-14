@@ -7,7 +7,7 @@ import requests
 from gradio_client import Client, handle_file
 
 # Import from constants file
-from constants import MAX_RENDER_TIME, RENDER_POLLING_INTERVAL
+from constants import RENDER_POLLING_INTERVAL
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ def download_audio(audio_url, output_path):
         logger.exception(f"Error downloading audio: {str(e)}")
         return False
 
-def speech_to_text_with_whisper(text, job_id, gpu_instance, api_key, output_dir):
+def speech_to_text_with_whisper(text, job_id, gpu_instance, api_key, output_dir, cancel_callback=None):
     """Transcribe speech to text using Whisper with configurable model options"""
     logger.info(f"Starting Whisper transcription for job: {job_id}")
 
@@ -54,17 +54,13 @@ def speech_to_text_with_whisper(text, job_id, gpu_instance, api_key, output_dir)
     whisper_url = f"https://{node_hostname}/whisper/"
     logger.info(f"Using Whisper endpoint: {whisper_url}")
 
-    # Define retry parameters
-    max_retries = 5
-    retry_delay = 5  # seconds
-
     # Create Gradio client with retries
     client = None
     last_error = None
 
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, 6):
         try:
-            logger.info(f"Attempt {attempt}/{max_retries} to connect to Whisper service...")
+            logger.info(f"Attempt {attempt}/5 to connect to Whisper service...")
 
             # Create Gradio client with API key header
             client = Client(
@@ -81,13 +77,13 @@ def speech_to_text_with_whisper(text, job_id, gpu_instance, api_key, output_dir)
             logger.warning(f"Failed to connect to Whisper service on attempt {attempt}: {str(e)}")
 
             # If this isn't the last attempt, wait before retrying
-            if attempt < max_retries:
-                logger.info(f"Waiting {retry_delay} seconds before retrying...")
-                time.sleep(retry_delay)
+            if attempt < 5:
+                logger.info(f"Waiting 5 seconds before retrying...")
+                time.sleep(5)
 
     # If we couldn't create the client after all retries, raise the last error
     if client is None:
-        logger.error(f"Failed to connect to Whisper service after {max_retries} attempts")
+        logger.error(f"Failed to connect to Whisper service after 5 attempts")
         raise last_error
 
     try:
@@ -117,30 +113,53 @@ def speech_to_text_with_whisper(text, job_id, gpu_instance, api_key, output_dir)
             "api_name": "/transcribe_audio"
         }
 
-        # Set up timeout tracking
+        # Set up timing tracking for logging purposes only
         start_time = time.time()
-        max_wait_time = MAX_RENDER_TIME
 
-        # Use the client with a custom progress tracking function to handle timeouts
-        logger.info(f"Starting Whisper transcription with {max_wait_time}s timeout")
+        # Use the client with a custom progress tracking function
+        logger.info("Starting Whisper transcription")
 
         result = None
 
         # Submit the prediction request and start tracking
         job = client.submit(**predict_params)
 
-        # Poll for completion with timeout
+        # Poll for completion
         while True:
-            elapsed_time = time.time() - start_time
-
-            if elapsed_time > max_wait_time:
-                logger.error(f"Whisper transcription timed out after {max_wait_time} seconds")
+            # Check for cancellation request
+            if cancel_callback and cancel_callback():
+                logger.warning("Job cancellation detected - terminating Whisper transcription")
                 # Try to cancel the job if possible
                 try:
                     job.cancel()
-                except:
-                    pass
-                raise Exception(f"Transcription timed out after {max_wait_time} seconds")
+                    logger.info("Sent cancellation request to Whisper")
+                except Exception as e:
+                    logger.warning(f"Error cancelling Whisper job: {e}")
+
+                # Get the specific error message from Redis if available
+                try:
+                    from redis import Redis
+                    redis_host = os.getenv("REDIS_HOST", "localhost")
+                    redis_port = int(os.getenv("REDIS_PORT", "6379"))
+                    redis_client = Redis(host=redis_host, port=redis_port, decode_responses=True)
+
+                    job_data = redis_client.hgetall(f"job:{job_id}")
+                    if job_data and "error" in job_data:
+                        error_msg = job_data["error"]
+                        logger.info(f"Using specific error reason from Redis: {error_msg}")
+                    else:
+                        error_msg = "Job was cancelled by system"
+                except Exception as e:
+                    logger.warning(f"Error retrieving specific error message: {e}")
+                    error_msg = "Job was cancelled by system"
+
+                # Clean up resources
+                if os.path.exists(audio_input_path):
+                    os.unlink(audio_input_path)
+
+                raise Exception(error_msg)
+
+            elapsed_time = time.time() - start_time
 
             # Check if job is done
             if job.done():

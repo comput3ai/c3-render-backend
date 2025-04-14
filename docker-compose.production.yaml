@@ -29,7 +29,7 @@ services:
     networks:
       - traefik-net
     deploy:
-      replicas: 4
+      replicas: ${API_REPLICAS:-2}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.render-api.rule=Host(`${RENDER_HOSTNAME}`)"
