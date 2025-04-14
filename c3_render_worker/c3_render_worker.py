@@ -25,7 +25,9 @@ from constants import (
     GPU_WORKER_DELAY,
     NO_GPU_WORKER_DELAY,
     LOCK_RETRY_INTERVAL,
-    QUEUE_CHECK_INTERVAL
+    QUEUE_CHECK_INTERVAL,
+    DEFAULT_GPU_LAUNCH,
+    DEFAULT_GPU_REPLACE
 )
 
 # Generate a unique worker ID (hostname is sufficient with lock expiration)
@@ -198,9 +200,9 @@ def launch_workload(workload_type="media:fast"):
     for attempt, delay in enumerate(retry_delays, 1):
         logger.info(f"Attempt {attempt}/{len(retry_delays)} to launch workload type: {workload_type}")
 
-        # Always set expiration to current time + 3600 seconds (1 hour)
+        # Always set expiration to current time + DEFAULT_GPU_LAUNCH seconds
         current_time = int(time.time())
-        expires = current_time + 3600
+        expires = current_time + DEFAULT_GPU_LAUNCH
 
         # Create launch data
         data = {
@@ -325,7 +327,7 @@ def monitor():
     global gpu_instance, last_job_time, monitor_active, current_job_id, current_job_data, job_start_time, job_cancel_flag
 
     idle_threshold = timedelta(seconds=GPU_IDLE_TIMEOUT)
-    max_gpu_runtime = timedelta(seconds=3600)  # 1 hour GPU maximum runtime
+    max_gpu_runtime = timedelta(seconds=DEFAULT_GPU_LAUNCH)  # Maximum GPU runtime
 
     while monitor_active and gpu_instance is not None:
         try:
@@ -367,7 +369,7 @@ def monitor():
                 gpu_time_left = max_gpu_runtime - gpu_runtime
 
                 if gpu_runtime > max_gpu_runtime:
-                    logger.info(f"GPU instance {gpu_instance.get('node')} has been running for over 1 hour.")
+                    logger.info(f"GPU instance {gpu_instance.get('node')} has been running for over {DEFAULT_GPU_LAUNCH} seconds.")
 
                     if current_job_id is None:
                         logger.info("Shutting down to refresh before approaching expiration limit.")
@@ -507,9 +509,9 @@ def get_gpu_instance():
     if gpu_instance is not None:
         # Check if the instance is healthy
         if is_gpu_healthy():
-            # Check if GPU has been running for more than 1 hour (3600 seconds)
-            if gpu_launch_time and (datetime.now() - gpu_launch_time).total_seconds() > 3600:
-                logger.info(f"GPU instance {gpu_instance.get('node')} has been running for over 1 hour. Shutting down for refresh.")
+            # Check if GPU has been running for more than DEFAULT_GPU_LAUNCH
+            if gpu_launch_time and (datetime.now() - gpu_launch_time).total_seconds() > DEFAULT_GPU_LAUNCH:
+                logger.info(f"GPU instance {gpu_instance.get('node')} has been running for over {DEFAULT_GPU_LAUNCH} seconds. Shutting down for refresh.")
                 shutdown_gpu_instance()
                 # Continue to launch a new instance
             else:
@@ -939,7 +941,8 @@ def process_job(job_id, gpu_instance):
 
 def _job_runner_thread(job_id, job_data, gpu_instance):
     """Thread that runs the actual job processing"""
-    global job_cancel_flag
+    global job_cancel_flag, current_job_id, current_job_data, job_start_time
+
     try:
         # Get job type
         job_type = job_data.get("type")
@@ -1004,7 +1007,18 @@ def _job_runner_thread(job_id, job_data, gpu_instance):
         else:
             logger.info(f"Job {job_id} is marked as cancelling, monitor thread is handling the webhook")
 
+        # Check if GPU has been running longer than DEFAULT_GPU_REPLACE after job completion
+        if gpu_launch_time and (datetime.now() - gpu_launch_time).total_seconds() > DEFAULT_GPU_REPLACE:
+            logger.info(f"GPU instance {gpu_instance.get('node')} has been running for more than {DEFAULT_GPU_REPLACE} seconds after job completion. Shutting down for refresh.")
+            shutdown_gpu_instance()
+
         logger.info(f"Job thread completed for {job_id} with success={success}")
+        
+        # Reset the job tracking variables
+        current_job_id = None
+        current_job_data = None
+        job_start_time = None
+        
     except Exception as e:
         error_msg = f"Error in job thread: {str(e)}"
         logger.exception(error_msg)
@@ -1018,6 +1032,11 @@ def _job_runner_thread(job_id, job_data, gpu_instance):
         # Only send webhook if not already being cancelled
         if not is_cancelling:
             send_webhook_notification(job_id, job_data, "failed", error=error_msg)
+        
+        # Reset the job tracking variables after an error too
+        current_job_id = None
+        current_job_data = None
+        job_start_time = None
 
 def lock_job(job_id, worker_id, lock_timeout=300):
     """
