@@ -10,6 +10,7 @@ import requests
 import random
 import socket
 import uuid
+import signal
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from minio import Minio
@@ -438,6 +439,11 @@ def monitor():
                     current_job_data = None
                     job_start_time = None
 
+                    # Shutdown the GPU instance to ensure a clean state
+                    logger.info(f"Shutting down GPU instance {gpu_instance.get('node')} due to job timeout")
+                    shutdown_gpu_instance()
+                    break
+
                 # 3b. Check for complete_by deadline, but first make sure job hasn't been reset
                 elif complete_by > 0 and current_job_id is not None:
                     now_readable = datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')
@@ -479,6 +485,11 @@ def monitor():
                         current_job_id = None
                         current_job_data = None
                         job_start_time = None
+
+                        # Shutdown the GPU instance to ensure a clean state
+                        logger.info(f"Shutting down GPU instance {gpu_instance.get('node')} due to job deadline exceeded")
+                        shutdown_gpu_instance()
+                        break
 
             # 4. Check idle time if no active job
             elif current_job_id is None:
@@ -1013,12 +1024,12 @@ def _job_runner_thread(job_id, job_data, gpu_instance):
             shutdown_gpu_instance()
 
         logger.info(f"Job thread completed for {job_id} with success={success}")
-        
+
         # Reset the job tracking variables
         current_job_id = None
         current_job_data = None
         job_start_time = None
-        
+
     except Exception as e:
         error_msg = f"Error in job thread: {str(e)}"
         logger.exception(error_msg)
@@ -1032,7 +1043,7 @@ def _job_runner_thread(job_id, job_data, gpu_instance):
         # Only send webhook if not already being cancelled
         if not is_cancelling:
             send_webhook_notification(job_id, job_data, "failed", error=error_msg)
-        
+
         # Reset the job tracking variables after an error too
         current_job_id = None
         current_job_data = None
@@ -1203,12 +1214,30 @@ def handle_expired_job(job_id):
         logger.error(f"Error handling expired job: {e}")
         return False
 
+def handle_shutdown_signal(signum, frame):
+    """Handle shutdown signals gracefully"""
+    signal_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+    logger.info(f"Received {signal_name} signal. Shutting down gracefully...")
+
+    # Shutdown GPU if it exists
+    if gpu_instance:
+        logger.info(f"Shutting down GPU instance {gpu_instance.get('node')} due to {signal_name} signal")
+        shutdown_gpu_instance()
+
+    # Exit with a success code
+    sys.exit(0)
+
 def main():
     """Main worker loop"""
     global gpu_instance, last_job_time
 
     logger.info(f"Starting C3 Render Worker with ID: {WORKER_ID}")
     logger.info(f"Using polling interval: Queue check={QUEUE_CHECK_INTERVAL}s")
+
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+    logger.info("Registered signal handlers for graceful shutdown")
 
     try:
         while True:
