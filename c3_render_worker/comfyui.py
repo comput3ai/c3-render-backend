@@ -626,7 +626,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                     "sonic_unet": "unet.pth",
                     "ip_audio_scale": 1,
                     "use_interframe": True,
-                    "dtype": "fp16",
+                    "dtype": "bf16",
                     "model": [
                         "32",
                         0
