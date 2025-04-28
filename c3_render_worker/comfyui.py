@@ -542,7 +542,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             "21": {
                 "inputs": {
                     "images": [
-                        "46",
+                        "58",
                         0
                     ]
                 },
@@ -553,7 +553,8 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
             },
             "26": {
                 "inputs": {
-                    "audio": uploaded_audio_name
+                    "audio": uploaded_audio_name,
+                    "audioUI": ""
                 },
                 "class_type": "LoadAudio",
                 "_meta": {
@@ -565,13 +566,13 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                     "seed": 2054408119,
                     "inference_steps": 25,
                     "dynamic_scale": 1,
-                    "fps": 25,
+                    "fps": 24,
                     "model": [
                         "34",
                         0
                     ],
                     "data_dict": [
-                        "35",
+                        "33",
                         0
                     ]
                 },
@@ -607,7 +608,7 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                         0
                     ],
                     "image": [
-                        "46",
+                        "58",
                         0
                     ],
                     "weight_dtype": [
@@ -636,34 +637,22 @@ def generate_portrait_video(image_url, audio_url, job_id, gpu_instance, api_key,
                     "title": "SONICTLoader"
                 }
             },
-            "35": {
+            "58": {
                 "inputs": {
-                    "anything": [
-                        "33",
-                        0
-                    ]
-                },
-                "class_type": "easy cleanGpuUsed",
-                "_meta": {
-                    "title": "Clean VRAM Used"
-                }
-            },
-            "46": {
-                "inputs": {
-                    "mode": "resize",
-                    "supersample": "true",
-                    "resampling": "lanczos",
-                    "rescale_factor": 1,
-                    "resize_width": new_width,
-                    "resize_height": new_height,
+                    "width": new_width,
+                    "height": new_height,
+                    "interpolation": "nearest",
+                    "method": "stretch",
+                    "condition": "always",
+                    "multiple_of": 0,
                     "image": [
                         "18",
                         0
                     ]
                 },
-                "class_type": "Image Resize",
+                "class_type": "ImageResize+",
                 "_meta": {
-                    "title": "Image Resize"
+                    "title": "🔧 Image Resize"
                 }
             }
         }
