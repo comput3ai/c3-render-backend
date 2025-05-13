@@ -1,0 +1,79 @@
+version: '3'
+services:
+  # Redis service for job queue
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - traefik-net
+
+  # API service with middleware defined in labels
+  api:
+    build:
+      context: ./c3_render_api
+      dockerfile: Dockerfile
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - API_KEY=${C3_RENDER_KEY}
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - traefik-net
+    deploy:
+      replicas: ${API_REPLICAS:-2}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.render-api.rule=Host(`${RENDER_HOSTNAME}`)"
+      - "traefik.http.routers.render-api.entrypoints=websecure"
+      - "traefik.http.routers.render-api.tls=true"
+      - "traefik.http.services.render-api.loadbalancer.server.port=5000"
+      - "traefik.http.middlewares.render-auth.plugin.traefik-api-key-auth.authenticationHeader=true"
+      - "traefik.http.middlewares.render-auth.plugin.traefik-api-key-auth.authenticationHeaderName=X-C3-RENDER-KEY"
+      - "traefik.http.middlewares.render-auth.plugin.traefik-api-key-auth.bearerHeader=true"
+      - "traefik.http.middlewares.render-auth.plugin.traefik-api-key-auth.bearerHeaderName=Authorization"
+      - "traefik.http.middlewares.render-auth.plugin.traefik-api-key-auth.removeHeadersOnSuccess=true"
+      - "traefik.http.middlewares.render-auth.plugin.traefik-api-key-auth.keys=${C3_RENDER_KEY}"
+      - "traefik.http.routers.render-api.middlewares=render-auth@docker"
+
+  # Worker service with dynamic scaling
+  worker:
+    build:
+      context: ./c3_render_worker
+      dockerfile: Dockerfile
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - C3_API_KEY=${C3_API_KEY}
+      - OUTPUT_DIR=/app/output
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_BUCKET=${MINIO_BUCKET}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_SECURE=${MINIO_SECURE:-false}
+      - MINIO_PUBLIC_URL=${MINIO_PUBLIC_URL}
+    volumes:
+      - worker_output:/app/output
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - traefik-net
+    deploy:
+      replicas: ${WORKER_REPLICAS:-3}
+
+volumes:
+  redis_data:
+  worker_output:
+
+networks:
+  traefik-net:
+    external: true

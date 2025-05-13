@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: c3_render_api/Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PORT=5000
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./c3_render_api:/app/c3_render_api
+    networks:
+      - c3render
+    env_file:
+      - c3_render_api/.env
+
+  worker:
+    build:
+      context: .
+      dockerfile: c3_render_worker/Dockerfile
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # Minio settings should be configured in c3_render_worker/.env
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./c3_render_worker:/app/c3_render_worker
+      - ./output:/app/output
+    networks:
+      - c3render
+    env_file:
+      - c3_render_worker/.env
+
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - c3render
+
+networks:
+  c3render:
+    driver: bridge
+
+volumes:
+  redis_data:

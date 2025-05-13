@@ -1,0 +1,8 @@
+redis
+requests
+python-dotenv
+minio
+gradio_client
+pillow
+mutagen
+python-magic
